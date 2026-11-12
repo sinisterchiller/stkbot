@@ -3,7 +3,9 @@
 Uses pytest ``tmp_path`` for isolated databases; no network, no tokens.
 """
 
+import os
 import sqlite3
+import stat
 
 import pytest
 
@@ -244,3 +246,81 @@ def test_no_duplicate_inserts_on_failed_validation(tmp_path):
     with pytest.raises(ValueError):
         store.add_reminder(1, 10, "NVDA", 100.0, "bad")
     assert store.list_all() == []
+
+
+# -- file permission hardening (POSIX-only) ------------------------------------
+
+# File mode hardening only has meaning on POSIX platforms; on Windows the
+# mode bits do not map to the same permissions, so these tests are skipped
+# there.
+requires_posix = pytest.mark.skipif(
+    os.name != "posix", reason="file mode hardening is POSIX-only"
+)
+
+
+def _file_mode(path) -> int:
+    """Return the permission bits of *path* (e.g. 0o600)."""
+    return stat.S_IMODE(os.stat(path).st_mode)
+
+
+@requires_posix
+def test_new_db_created_with_owner_only_mode(tmp_path):
+    """A brand-new database file is created 0600, not umask-default 0644."""
+    store = _make_store(tmp_path)
+    rid = store.add_reminder(1, 2, "NVDA", 100.0, "above")
+    assert _file_mode(tmp_path / "reminders.db") == 0o600
+    # The data is still readable after the mode tightening.
+    assert store.get_by_id(rid)["ticker"] == "NVDA"
+
+
+@requires_posix
+def test_existing_world_readable_db_tightened_without_data_loss(tmp_path):
+    """A pre-existing 0644 database is upgraded to 0600 in place."""
+    db = tmp_path / "reminders.db"
+    store1 = _make_store(tmp_path)
+    rid = store1.add_reminder(1, 2, "NVDA", 100.0, "above")
+    # Simulate a database created before the hardening (umask 022).
+    os.chmod(db, 0o644)
+
+    store2 = _make_store(tmp_path)
+    rows = store2.list_by_user(1)
+    assert _file_mode(db) == 0o600
+    assert len(rows) == 1
+    assert rows[0]["id"] == rid
+    assert rows[0]["ticker"] == "NVDA"
+    assert rows[0]["target_price"] == 100.0
+
+
+@requires_posix
+def test_wal_shm_sidecars_not_left_world_readable(tmp_path):
+    """Sidecar files present on disk are re-tightened to 0600 on open."""
+    db = tmp_path / "reminders.db"
+    store = _make_store(tmp_path)
+    store.add_reminder(1, 2, "NVDA", 100.0, "above")
+
+    # Keep a second WAL connection open so -wal/-shm exist on disk, then
+    # relax them to the umask-022 default to simulate the pre-hardening
+    # state.
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            "INSERT INTO reminders (user_id, channel_id, ticker, target_price, direction, created_at) "
+            "VALUES (1, 2, 'AAPL', 200.0, 'below', '2026-01-01T00:00:00+00:00')"
+        )
+        conn.commit()
+        for suffix in ("-wal", "-shm"):
+            sidecar = db.with_name(db.name + suffix)
+            if sidecar.exists():
+                os.chmod(sidecar, 0o644)
+
+        # The store's next open must re-tighten any sidecar present.
+        rows = store.list_by_user(1)
+        for suffix in ("-wal", "-shm"):
+            sidecar = db.with_name(db.name + suffix)
+            if sidecar.exists():
+                assert _file_mode(sidecar) == 0o600
+        # Persistence is intact through the tightened open.
+        assert len(rows) == 2
+    finally:
+        conn.close()

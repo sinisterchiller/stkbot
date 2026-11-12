@@ -14,6 +14,7 @@ path via the ``db_path`` constructor argument.
 from __future__ import annotations
 
 import math
+import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -69,6 +70,82 @@ def _row_to_dict(row: sqlite3.Row) -> dict:
     return dict(row)
 
 
+# --- file permission hardening ------------------------------------------------
+
+# Owner-only mode for the database file and its SQLite sidecars.  The
+# pending alerts store user IDs, channel IDs and private alert targets,
+# so none of these files may be world-readable (the default umask 022
+# would leave them at 0644).
+_DB_FILE_MODE = 0o600
+
+# SQLite sidecar files that can contain the same alert data as the
+# database file itself.
+_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
+
+
+def _tighten_file_mode(path: Path) -> None:
+    """Chmod *path* to owner-only 0600, failing loudly when impossible.
+
+    Refuses symlinked paths (the target may live outside the checkout)
+    and raises RuntimeError when the mode cannot be set (for example
+    when the file is owned by another user).
+    """
+    if path.is_symlink():
+        raise RuntimeError(
+            f"refusing to restrict a symlinked database path: {path}"
+        )
+    try:
+        os.chmod(path, _DB_FILE_MODE)
+    except OSError as exc:
+        raise RuntimeError(
+            f"cannot restrict {path} to owner-only 0600 (the file may be "
+            f"owned by another user): {exc}"
+        ) from exc
+
+
+def _prepare_db_file(db_path: Path) -> None:
+    """Ensure the database file exists with owner-only 0600 mode.
+
+    A missing file is created empty *before* sqlite3 opens it, so the
+    file never appears on disk with the process umask's default
+    permissions.  An existing file is tightened in place; its contents
+    are never touched, so pending alerts survive the upgrade.
+    """
+    if db_path.is_symlink():
+        raise RuntimeError(
+            f"refusing to open a symlinked database path: {db_path}"
+        )
+    if db_path.exists():
+        _tighten_file_mode(db_path)
+    else:
+        fd = os.open(str(db_path), os.O_CREAT | os.O_WRONLY, _DB_FILE_MODE)
+        os.close(fd)
+        # Explicit chmod: the mode passed to os.open is masked by the
+        # process umask, which is exactly the race we are avoiding.
+        _tighten_file_mode(db_path)
+
+
+def _tighten_sidecar_files(db_path: Path) -> None:
+    """Best-effort 0600 on any SQLite sidecar files present on disk.
+
+    Sidecars are transient (SQLite removes -wal/-shm on the last close)
+    and are re-checked on every connection, so a sidecar created with
+    the process umask during an operation is re-tightened by the next
+    open.  Symlinked sidecars are skipped rather than followed, since
+    their target may lie outside the checkout.
+    """
+    for suffix in _SIDECAR_SUFFIXES:
+        sidecar = db_path.with_name(db_path.name + suffix)
+        if sidecar.is_symlink() or not sidecar.exists():
+            continue
+        try:
+            os.chmod(sidecar, _DB_FILE_MODE)
+        except OSError:
+            # Sidecars are transient; a file we cannot chmod (for example
+            # one owned by another user) is left for the next open.
+            pass
+
+
 # --- store ------------------------------------------------------------------
 
 
@@ -91,10 +168,22 @@ class ReminderStore:
     # -- connection helper ---------------------------------------------------
 
     def _connect(self) -> sqlite3.Connection:
-        """Open a new connection with row access by column name."""
+        """Open a new connection with row access by column name.
+
+        On POSIX the database file is tightened to owner-only 0600
+        *before* the connection is made, so no WAL sidecar can be
+        created on top of a world-readable database file, and any
+        sidecar files already present are re-tightened after the
+        connection opens.  On non-POSIX platforms the mode bits do not
+        map to the same permissions, so no hardening is applied.
+        """
+        if os.name == "posix":
+            _prepare_db_file(self._db_path)
         conn = sqlite3.connect(str(self._db_path))
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
+        if os.name == "posix":
+            _tighten_sidecar_files(self._db_path)
         return conn
 
     def _ensure_schema(self, conn: sqlite3.Connection) -> None:
