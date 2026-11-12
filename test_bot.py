@@ -1,5 +1,6 @@
 """Tests for the Discord stock price bot."""
 
+import sys
 import threading
 from io import BytesIO
 from types import SimpleNamespace
@@ -14,8 +15,10 @@ from discord import app_commands
 
 import bot as bot_module
 from bot import (
+    REMINDER_EMBED_CHAR_BUDGET,
     REMINDER_EMBEDS_PER_MESSAGE,
     REMINDER_FIELDS_PER_EMBED,
+    REMINDER_MESSAGE_CHAR_BUDGET,
     TICKER_PATTERN,
     check_price_alerts,
     fetch_latest_price,
@@ -1572,6 +1575,57 @@ class TestRemindersCommand:
             for call in interaction.followup.send.await_args_list
         ]
 
+    @staticmethod
+    def embed_chars(embed):
+        """Discord's total embed-text count: title, description, fields, footer, author."""
+        total = 0
+        if embed.title:
+            total += len(embed.title)
+        if embed.description:
+            total += len(embed.description)
+        for field in embed.fields:
+            total += len(field.name) + len(field.value)
+        if embed.footer is not None and embed.footer.text:
+            total += len(embed.footer.text)
+        if embed.author is not None and embed.author.name:
+            total += len(embed.author.name)
+        return total
+
+    @staticmethod
+    def assert_discord_limits(messages):
+        """Simulate Discord's caps on every sent /reminders message.
+
+        Each message must hold at most 10 embeds whose combined text stays
+        within the safety-margin message budget, and each embed must stay
+        within the 25-field count, 256-character name, 1024-character value
+        and safety-margin total-text budgets.
+        """
+        for ephemeral, embeds in messages:
+            assert ephemeral is True
+            assert len(embeds) <= REMINDER_EMBEDS_PER_MESSAGE
+            assert (
+                sum(TestRemindersCommand.embed_chars(embed) for embed in embeds)
+                <= REMINDER_MESSAGE_CHAR_BUDGET
+            )
+            for embed in embeds:
+                assert len(embed.fields) <= REMINDER_FIELDS_PER_EMBED
+                assert (
+                    TestRemindersCommand.embed_chars(embed) <= REMINDER_EMBED_CHAR_BUDGET
+                )
+                for field in embed.fields:
+                    assert len(field.name) <= 256
+                    assert len(field.value) <= 1024
+
+    @staticmethod
+    def all_field_names(messages):
+        """Every field name across all sent messages, in order."""
+        return [
+            field.name
+            for _, embeds in messages
+            for embed in embeds
+            for field in embed.fields
+        ]
+
     @pytest.mark.asyncio
     async def test_many_alerts_chunk_into_bounded_embeds(self, tmp_path):
         # 30 alerts fit in one message (two embeds), each inside the limits.
@@ -1587,19 +1641,19 @@ class TestRemindersCommand:
         messages = self.sent_messages(interaction)
         assert len(messages) == 1
         assert all(ephemeral for ephemeral, _ in messages)
+        self.assert_discord_limits(messages)
         embeds = messages[0][1]
         assert len(embeds) == 2
         assert [len(embed.fields) for embed in embeds] == [
             REMINDER_FIELDS_PER_EMBED,
             30 - REMINDER_FIELDS_PER_EMBED,
         ]
-        for embed in embeds:
-            assert len(embed.fields) <= 25
 
     @pytest.mark.asyncio
     async def test_251_alerts_split_across_multiple_messages(self, tmp_path):
-        # 251 alerts need 11 embeds: one full message of 10 embeds plus a
-        # second ephemeral message with one embed, in order.
+        # 251 alerts need 11 embeds; the per-message character budget caps
+        # each message at 8 embeds, so the list splits into [8, 3], in order,
+        # with every message inside Discord's limits.
         store = ReminderStore(db_path=tmp_path / "reminders.db")
         for index in range(251):
             store.add_reminder(42, 10, "NVDA", 100.0 + index, "above")
@@ -1612,28 +1666,19 @@ class TestRemindersCommand:
         messages = self.sent_messages(interaction)
         assert len(messages) == 2
         assert all(ephemeral for ephemeral, _ in messages)
-        assert [len(embeds) for _, embeds in messages] == [
-            REMINDER_EMBEDS_PER_MESSAGE,
-            1,
-        ]
-        assert all(len(embeds) <= 10 for _, embeds in messages)
-        assert all(
-            len(embed.fields) <= 25 for _, embeds in messages for embed in embeds
-        )
+        assert [len(embeds) for _, embeds in messages] == [8, 3]
+        self.assert_discord_limits(messages)
 
-        names = [
-            field.name
-            for _, embeds in messages
-            for embed in embeds
-            for field in embed.fields
-        ]
+        names = self.all_field_names(messages)
         assert names[0] == "#1 NVDA"
         assert names[-1] == "#251 NVDA"
         assert len(names) == 251
 
     @pytest.mark.asyncio
-    async def test_250_alerts_fill_exactly_ten_embeds_per_message(self, tmp_path):
-        # 250 alerts are exactly one message: 10 embeds of 25 fields each.
+    async def test_250_alerts_split_across_char_budgeted_messages(self, tmp_path):
+        # 250 alerts are 10 full embeds whose combined text exceeds the
+        # per-message character budget, so the list splits into [8, 2]
+        # messages, in order, with no alert missing.
         store = ReminderStore(db_path=tmp_path / "reminders.db")
         for index in range(250):
             store.add_reminder(42, 10, "NVDA", 100.0 + index, "above")
@@ -1642,15 +1687,17 @@ class TestRemindersCommand:
         with patch("bot.reminder_store", store):
             await reminders.callback(interaction)
 
+        interaction.response.defer.assert_awaited_once_with(thinking=True, ephemeral=True)
         messages = self.sent_messages(interaction)
-        assert len(messages) == 1
+        assert len(messages) == 2
         assert all(ephemeral for ephemeral, _ in messages)
-        assert [len(embeds) for _, embeds in messages] == [
-            REMINDER_EMBEDS_PER_MESSAGE
-        ]
-        assert all(
-            len(embed.fields) == 25 for _, embeds in messages for embed in embeds
-        )
+        assert [len(embeds) for _, embeds in messages] == [8, 2]
+        self.assert_discord_limits(messages)
+
+        names = self.all_field_names(messages)
+        assert names[0] == "#1 NVDA"
+        assert names[-1] == "#250 NVDA"
+        assert len(names) == 250
 
     @pytest.mark.asyncio
     async def test_120_alerts_chunk_into_five_embeds_in_one_message(self, tmp_path):
@@ -1667,11 +1714,108 @@ class TestRemindersCommand:
         messages = self.sent_messages(interaction)
         assert len(messages) == 1
         assert all(ephemeral for ephemeral, _ in messages)
+        self.assert_discord_limits(messages)
         embeds = messages[0][1]
         assert [len(embed.fields) for embed in embeds] == [25, 25, 25, 25, 20]
         names = [field.name for embed in embeds for field in embed.fields]
         assert names[0] == "#1 NVDA"
         assert names[-1] == "#120 NVDA"
+
+    @pytest.mark.asyncio
+    async def test_260_alerts_keep_every_message_within_discord_limits(
+        self, tmp_path
+    ):
+        # 260 normal alerts: every sent message must stay inside Discord's
+        # simulated limits (embed count, per-embed and per-message character
+        # budgets) and no alert may be missing, in order.
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        for index in range(260):
+            store.add_reminder(42, 10, "NVDA", 100.0 + index, "above")
+        interaction = self.make_interaction()
+
+        with patch("bot.reminder_store", store):
+            await reminders.callback(interaction)
+
+        interaction.response.defer.assert_awaited_once_with(thinking=True, ephemeral=True)
+        messages = self.sent_messages(interaction)
+        assert len(messages) >= 2
+        self.assert_discord_limits(messages)
+
+        names = self.all_field_names(messages)
+        assert len(names) == 260
+        assert names == [f"#{index} NVDA" for index in range(1, 261)]
+
+    @pytest.mark.asyncio
+    async def test_huge_price_alerts_stay_within_limits_without_exception(
+        self, tmp_path
+    ):
+        # 1e300 formats to ~310 digits with %.2f: the field value must stay
+        # inside Discord's 1024-character cap, the char budgets must split
+        # the embeds, and no alert may be dropped.
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        for index in range(30):
+            store.add_reminder(42, 10, "NVDA", 1e300, "above")
+        interaction = self.make_interaction()
+
+        with patch("bot.reminder_store", store):
+            await reminders.callback(interaction)
+
+        interaction.response.defer.assert_awaited_once_with(thinking=True, ephemeral=True)
+        messages = self.sent_messages(interaction)
+        assert all(ephemeral for ephemeral, _ in messages)
+        self.assert_discord_limits(messages)
+
+        names = self.all_field_names(messages)
+        assert len(names) == 30
+        assert names[0] == "#1 NVDA"
+        assert names[-1] == "#30 NVDA"
+
+    def test_build_reminder_embeds_splits_on_char_budget_for_extreme_rows(self):
+        # 15-character tickers and the largest finite price make each field
+        # ~340 characters, so one 25-field embed would exceed the embed
+        # character budget: the builder must split and keep every row.
+        rows = [
+            {
+                "id": index,
+                "ticker": "ABCDEFGHIJKLMNOPQ",
+                "target_price": sys.float_info.max,
+                "direction": "above",
+            }
+            for index in range(1, 26)
+        ]
+        embeds = bot_module._build_reminder_embeds(rows)
+
+        assert len(embeds) == 2
+        assert [len(embed.fields) for embed in embeds] == [16, 9]
+        for embed in embeds:
+            assert bot_module._reminder_embed_char_count(embed) <= REMINDER_EMBED_CHAR_BUDGET
+            for field in embed.fields:
+                assert len(field.name) <= 256
+                assert len(field.value) <= 1024
+        names = [field.name for embed in embeds for field in embed.fields]
+        assert names == [
+            f"#{index} ABCDEFGHIJKLMNOPQ" for index in range(1, 26)
+        ]
+
+    def test_reminder_embed_messages_respects_embed_and_char_limits(self):
+        # Twelve ~600-character embeds: both the 10-embed cap and the
+        # per-message character budget must be enforced, in order, with no
+        # embed lost.
+        embeds = [
+            discord.Embed(title="t" * 500, description="d" * 100)
+            for _ in range(12)
+        ]
+        messages = bot_module._reminder_embed_messages(embeds)
+
+        assert [len(message) for message in messages] == [9, 3]
+        flat = [embed for message in messages for embed in message]
+        assert flat == embeds
+        for message in messages:
+            assert len(message) <= REMINDER_EMBEDS_PER_MESSAGE
+            assert (
+                sum(self.embed_chars(embed) for embed in message)
+                <= REMINDER_MESSAGE_CHAR_BUDGET
+            )
 
 
 class TestUnremindCommand:

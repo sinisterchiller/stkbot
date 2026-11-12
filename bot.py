@@ -73,12 +73,16 @@ GUILD_SYNC_RETRY_DELAY = 5.0
 # loops, so this loop is started exactly once in StockPriceBot.setup_hook.
 ALERT_CHECK_SECONDS = 60
 
-# Discord caps an embed at 25 fields and a message at 10 embeds; one field
-# per reminder keeps /reminders readable, and long lists are split across
-# several ephemeral follow-up messages of at most REMINDER_EMBEDS_PER_MESSAGE
-# embeds each.
+# Discord caps an embed at 25 fields and a message at 10 embeds, and counts
+# an embed's title, description, field names/values, footer and author text
+# toward a 6000-character total (a message's embed texts together count
+# against the same 6000 characters). Batching therefore caps both field
+# counts and character totals, using a safety margin below the 6000 cap so
+# Unicode and client rounding can never push a real message over the limit.
 REMINDER_FIELDS_PER_EMBED = 25
 REMINDER_EMBEDS_PER_MESSAGE = 10
+REMINDER_EMBED_CHAR_BUDGET = 5500
+REMINDER_MESSAGE_CHAR_BUDGET = 5500
 
 
 def parse_guild_id(raw: Optional[str]) -> Optional[int]:
@@ -891,35 +895,97 @@ def _build_remind_embed(
     return embed
 
 
-def _reminder_embed_messages(embeds: list[discord.Embed]) -> list[list[discord.Embed]]:
-    """Split embeds into messages of at most REMINDER_EMBEDS_PER_MESSAGE each.
+def _reminder_field_for(row: dict) -> tuple[str, str]:
+    """The one field an alert row becomes in a /reminders embed.
 
-    Keeps /reminders inside Discord's 10-embeds-per-message limit; order is
-    preserved, so a long list becomes several ephemeral follow-up messages.
+    Field names and values are built from bounded inputs (integer ID,
+    TICKER_PATTERN ticker, positive finite price with ``%.2f``), so they
+    always stay inside Discord's 256-character name and 1024-character value
+    limits without truncation.
     """
-    return [
-        embeds[start : start + REMINDER_EMBEDS_PER_MESSAGE]
-        for start in range(0, len(embeds), REMINDER_EMBEDS_PER_MESSAGE)
-    ]
+    return (
+        f"#{row['id']} {row['ticker']}",
+        f"${row['target_price']:.2f} ({row['direction']})",
+    )
+
+
+def _reminder_embed_char_count(embed: discord.Embed) -> int:
+    """Total embed text length counted the way Discord counts it.
+
+    Discord sums title, description, every field's name and value, footer
+    text and author name toward the 6000-character embed cap, so this is the
+    number the budgeting code must keep under REMINDER_EMBED_CHAR_BUDGET.
+    """
+    total = 0
+    if embed.title:
+        total += len(embed.title)
+    if embed.description:
+        total += len(embed.description)
+    for field in embed.fields:
+        total += len(field.name) + len(field.value)
+    if embed.footer is not None and embed.footer.text:
+        total += len(embed.footer.text)
+    if embed.author is not None and embed.author.name:
+        total += len(embed.author.name)
+    return total
+
+
+def _reminder_embed_messages(embeds: list[discord.Embed]) -> list[list[discord.Embed]]:
+    """Split embeds into messages inside Discord's per-message limits.
+
+    Each message holds at most REMINDER_EMBEDS_PER_MESSAGE embeds, and the
+    sum of their embed text lengths must stay within
+    REMINDER_MESSAGE_CHAR_BUDGET (a safety margin below Discord's 6000
+    character per-message embed cap). Order is preserved, so a long list
+    becomes several ephemeral follow-up messages with no alert missing.
+    """
+    messages: list[list[discord.Embed]] = []
+    current: list[discord.Embed] = []
+    current_chars = 0
+    for embed in embeds:
+        chars = _reminder_embed_char_count(embed)
+        if current and (
+            len(current) >= REMINDER_EMBEDS_PER_MESSAGE
+            or current_chars + chars > REMINDER_MESSAGE_CHAR_BUDGET
+        ):
+            messages.append(current)
+            current = []
+            current_chars = 0
+        current.append(embed)
+        current_chars += chars
+    if current:
+        messages.append(current)
+    return messages
 
 
 def _build_reminder_embeds(rows: list[dict]) -> list[discord.Embed]:
-    """One embed per chunk of at most REMINDER_FIELDS_PER_EMBED reminders.
+    """Embeds for /reminders, chunked inside Discord's per-embed limits.
 
-    Chunking keeps /reminders inside Discord's 25-field-per-embed limit.
+    A new embed starts when the field count would reach
+    REMINDER_FIELDS_PER_EMBED or the embed's total text would exceed
+    REMINDER_EMBED_CHAR_BUDGET (a safety margin below Discord's 6000
+    character embed cap), so even extremely long formatted prices keep
+    every embed within the limits without truncating any alert.
     """
     embeds: list[discord.Embed] = []
-    for start in range(0, len(rows), REMINDER_FIELDS_PER_EMBED):
-        embed = discord.Embed(
-            title="Your pending price alerts",
-            color=discord.Color.blue(),
-        )
-        for row in rows[start : start + REMINDER_FIELDS_PER_EMBED]:
-            embed.add_field(
-                name=f"#{row['id']} {row['ticker']}",
-                value=f"${row['target_price']:.2f} ({row['direction']})",
-                inline=True,
+    embed: Optional[discord.Embed] = None
+    for row in rows:
+        name, value = _reminder_field_for(row)
+        field_chars = len(name) + len(value)
+        if (
+            embed is None
+            or len(embed.fields) >= REMINDER_FIELDS_PER_EMBED
+            or _reminder_embed_char_count(embed) + field_chars
+            > REMINDER_EMBED_CHAR_BUDGET
+        ):
+            if embed is not None:
+                embeds.append(embed)
+            embed = discord.Embed(
+                title="Your pending price alerts",
+                color=discord.Color.blue(),
             )
+        embed.add_field(name=name, value=value, inline=True)
+    if embed is not None:
         embeds.append(embed)
     return embeds
 
@@ -1122,8 +1188,9 @@ async def reminders(interaction: discord.Interaction):
     """Slash command to list the invoking user's pending alerts (ephemeral).
 
     Long lists are split across several ephemeral follow-up messages, each
-    holding at most 10 embeds of 25 fields, so the full list stays inside
-    Discord's per-message and per-embed limits.
+    holding at most 10 embeds whose combined text length stays within
+    Discord's per-message limit, and each embed stays within the 25-field and
+    6000-character embed limits, so the full list is always shown.
     """
     await interaction.response.defer(thinking=True, ephemeral=True)
 
