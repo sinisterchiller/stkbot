@@ -73,9 +73,12 @@ GUILD_SYNC_RETRY_DELAY = 5.0
 # loops, so this loop is started exactly once in StockPriceBot.setup_hook.
 ALERT_CHECK_SECONDS = 60
 
-# Discord caps an embed at 25 fields; one field per reminder keeps /reminders
-# readable and chunked safely.
+# Discord caps an embed at 25 fields and a message at 10 embeds; one field
+# per reminder keeps /reminders readable, and long lists are split across
+# several ephemeral follow-up messages of at most REMINDER_EMBEDS_PER_MESSAGE
+# embeds each.
 REMINDER_FIELDS_PER_EMBED = 25
+REMINDER_EMBEDS_PER_MESSAGE = 10
 
 
 def parse_guild_id(raw: Optional[str]) -> Optional[int]:
@@ -289,6 +292,16 @@ class StockPriceBot(commands.Bot):
     def forget_guild(self, guild_id: int) -> None:
         """Drop sync state so rejoining the guild registers commands again."""
         self._synced_guild_ids.discard(guild_id)
+
+    async def close(self) -> None:
+        """Stop the price-alert loop, then shut the client down.
+
+        discord.py does not cancel ext.tasks loops on shutdown, so the loop is
+        cancelled here before super's close, which is idempotent and awaited
+        even when the bot never connected.
+        """
+        price_alerts_loop.cancel()
+        await super().close()
 
 
 intents = discord.Intents.default()
@@ -787,13 +800,6 @@ async def on_guild_remove(guild):
     bot.forget_guild(guild.id)
 
 
-@bot.event
-async def on_close():
-    # discord.py does not cancel ext.tasks loops on close, so stop the alert
-    # checker cleanly when the bot shuts down.
-    price_alerts_loop.cancel()
-
-
 @bot.tree.command(
     name="price",
     description="Latest stock price (extended hours) with 1D 5-min extended-hours chart",
@@ -883,6 +889,18 @@ def _build_remind_embed(
     embed.add_field(name="Current", value=f"${quote.price:.2f}", inline=True)
     embed.add_field(name="Direction", value=direction, inline=True)
     return embed
+
+
+def _reminder_embed_messages(embeds: list[discord.Embed]) -> list[list[discord.Embed]]:
+    """Split embeds into messages of at most REMINDER_EMBEDS_PER_MESSAGE each.
+
+    Keeps /reminders inside Discord's 10-embeds-per-message limit; order is
+    preserved, so a long list becomes several ephemeral follow-up messages.
+    """
+    return [
+        embeds[start : start + REMINDER_EMBEDS_PER_MESSAGE]
+        for start in range(0, len(embeds), REMINDER_EMBEDS_PER_MESSAGE)
+    ]
 
 
 def _build_reminder_embeds(rows: list[dict]) -> list[discord.Embed]:
@@ -979,7 +997,14 @@ async def check_price_alerts() -> None:
         try:
             await channel.send(
                 _alert_message(row, quote),
-                allowed_mentions=discord.AllowedMentions(users=True),
+                allowed_mentions=discord.AllowedMentions(
+                    # Restrict mentions to the alert owner's user ID exactly;
+                    # @everyone, @role and replied-user mentions must stay off.
+                    users=[discord.Object(id=row["user_id"])],
+                    everyone=False,
+                    roles=False,
+                    replied_user=False,
+                ),
             )
         except Exception as exc:
             print(
@@ -1027,7 +1052,9 @@ async def remind(interaction: discord.Interaction, ticker: str, target: float):
     price at displayed precision is rejected, so an alert created on a
     stale closed-market quote cannot fire on that same stale value.
     """
-    await interaction.response.defer(thinking=True)
+    # Ephemeral defer keeps the private confirmation and every follow-up
+    # response visible only to the invoking user.
+    await interaction.response.defer(thinking=True, ephemeral=True)
 
     normalized = ticker.strip().upper()
     channel = interaction.channel
@@ -1092,8 +1119,13 @@ async def remind(interaction: discord.Interaction, ticker: str, target: float):
 
 @bot.tree.command(name="reminders", description="List your pending price alerts")
 async def reminders(interaction: discord.Interaction):
-    """Slash command to list the invoking user's pending alerts (ephemeral)."""
-    await interaction.response.defer(thinking=True)
+    """Slash command to list the invoking user's pending alerts (ephemeral).
+
+    Long lists are split across several ephemeral follow-up messages, each
+    holding at most 10 embeds of 25 fields, so the full list stays inside
+    Discord's per-message and per-embed limits.
+    """
+    await interaction.response.defer(thinking=True, ephemeral=True)
 
     rows = await asyncio.to_thread(reminder_store.list_by_user, interaction.user.id)
     if not rows:
@@ -1103,16 +1135,15 @@ async def reminders(interaction: discord.Interaction):
         )
         return
 
-    await interaction.followup.send(
-        embeds=_build_reminder_embeds(rows), ephemeral=True
-    )
+    for message_embeds in _reminder_embed_messages(_build_reminder_embeds(rows)):
+        await interaction.followup.send(embeds=message_embeds, ephemeral=True)
 
 
 @bot.tree.command(name="unremind", description="Cancel one of your price alerts by ID")
 @app_commands.describe(id="Alert ID shown by /reminders")
 async def unremind(interaction: discord.Interaction, id: int):
     """Slash command to cancel one of the invoking user's alerts (owner only)."""
-    await interaction.response.defer(thinking=True)
+    await interaction.response.defer(thinking=True, ephemeral=True)
 
     deleted = await asyncio.to_thread(reminder_store.delete_by_id, id, interaction.user.id)
     if deleted:

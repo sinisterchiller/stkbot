@@ -14,13 +14,13 @@ from discord import app_commands
 
 import bot as bot_module
 from bot import (
+    REMINDER_EMBEDS_PER_MESSAGE,
     REMINDER_FIELDS_PER_EMBED,
     TICKER_PATTERN,
     check_price_alerts,
     fetch_latest_price,
     fetch_quote,
     generate_chart,
-    on_close,
     parse_guild_id,
     price,
     price_alerts_loop,
@@ -1387,7 +1387,7 @@ class TestRemindCommand:
         ):
             await remind.callback(interaction, " nvda ", 150.0)
 
-        interaction.response.defer.assert_awaited_once_with(thinking=True)
+        interaction.response.defer.assert_awaited_once_with(thinking=True, ephemeral=True)
         interaction.followup.send.assert_awaited_once()
         kwargs = interaction.followup.send.await_args.kwargs
         assert kwargs["ephemeral"] is True
@@ -1420,6 +1420,9 @@ class TestRemindCommand:
         ):
             await remind.callback(interaction, "NVDA", 140.0)
 
+        interaction.response.defer.assert_awaited_once_with(thinking=True, ephemeral=True)
+        interaction.followup.send.assert_awaited_once()
+        assert interaction.followup.send.await_args.kwargs["ephemeral"] is True
         rows = store.list_by_user(42)
         assert rows[0]["direction"] == "below"
 
@@ -1435,6 +1438,7 @@ class TestRemindCommand:
         ):
             await remind.callback(interaction, "NVDA", 148.50)
 
+        interaction.response.defer.assert_awaited_once_with(thinking=True, ephemeral=True)
         interaction.followup.send.assert_awaited_once()
         assert interaction.followup.send.await_args.kwargs["ephemeral"] is True
         assert "already trading at" in interaction.followup.send.await_args.args[0]
@@ -1449,7 +1453,9 @@ class TestRemindCommand:
         ):
             await remind.callback(interaction, "bad ticker!", 150.0)
 
+        interaction.response.defer.assert_awaited_once_with(thinking=True, ephemeral=True)
         ticker_mock.assert_not_called()
+        interaction.followup.send.assert_awaited_once()
         assert "not a valid ticker" in interaction.followup.send.await_args.args[0]
         assert interaction.followup.send.await_args.kwargs["ephemeral"] is True
 
@@ -1462,8 +1468,11 @@ class TestRemindCommand:
         ):
             await remind.callback(interaction, "NVDA", -5.0)
 
+        interaction.response.defer.assert_awaited_once_with(thinking=True, ephemeral=True)
         ticker_mock.assert_not_called()
+        interaction.followup.send.assert_awaited_once()
         assert "positive number" in interaction.followup.send.await_args.args[0]
+        assert interaction.followup.send.await_args.kwargs["ephemeral"] is True
 
     @pytest.mark.asyncio
     async def test_dm_channel_rejected_without_saving(self, tmp_path):
@@ -1475,9 +1484,12 @@ class TestRemindCommand:
         ):
             await remind.callback(interaction, "NVDA", 150.0)
 
+        interaction.response.defer.assert_awaited_once_with(thinking=True, ephemeral=True)
         ticker_mock.assert_not_called()
+        interaction.followup.send.assert_awaited_once()
         assert store.list_all() == []
         assert "server channels" in interaction.followup.send.await_args.args[0]
+        assert interaction.followup.send.await_args.kwargs["ephemeral"] is True
 
     @pytest.mark.asyncio
     async def test_fetch_failure_does_not_save(self, tmp_path):
@@ -1488,8 +1500,11 @@ class TestRemindCommand:
         with patch("bot.yf.Ticker", return_value=fake), patch("bot.reminder_store", store):
             await remind.callback(interaction, "NVDA", 150.0)
 
+        interaction.response.defer.assert_awaited_once_with(thinking=True, ephemeral=True)
         assert store.list_all() == []
+        interaction.followup.send.assert_awaited_once()
         assert "Could not fetch a latest price" in interaction.followup.send.await_args.args[0]
+        assert interaction.followup.send.await_args.kwargs["ephemeral"] is True
 
     @pytest.mark.asyncio
     async def test_fetch_and_store_run_off_the_event_loop(self, tmp_path):
@@ -1500,6 +1515,7 @@ class TestRemindCommand:
         with patch("bot.yf.Ticker", return_value=fake), patch("bot.reminder_store", store):
             await remind.callback(interaction, "NVDA", 150.0)
 
+        interaction.response.defer.assert_awaited_once_with(thinking=True, ephemeral=True)
         assert fake.history_thread_ids[0] != threading.get_ident()
         assert len(store.list_by_user(42)) == 1
 
@@ -1523,6 +1539,7 @@ class TestRemindersCommand:
         with patch("bot.reminder_store", store):
             await reminders.callback(interaction)
 
+        interaction.response.defer.assert_awaited_once_with(thinking=True, ephemeral=True)
         interaction.followup.send.assert_awaited_once()
         assert interaction.followup.send.await_args.kwargs["ephemeral"] is True
         assert "no pending price alerts" in interaction.followup.send.await_args.args[0]
@@ -1538,6 +1555,7 @@ class TestRemindersCommand:
         with patch("bot.reminder_store", store):
             await reminders.callback(interaction)
 
+        interaction.response.defer.assert_awaited_once_with(thinking=True, ephemeral=True)
         kwargs = interaction.followup.send.await_args.kwargs
         assert kwargs["ephemeral"] is True
         embeds = kwargs["embeds"]
@@ -1546,8 +1564,17 @@ class TestRemindersCommand:
         assert ("#2 AAPL", "$200.00 (below)") in fields
         assert not any(name.startswith("#3") for name, _ in fields)
 
+    @staticmethod
+    def sent_messages(interaction):
+        """Every follow-up send as an (ephemeral, embeds) pair, in order."""
+        return [
+            (call.kwargs["ephemeral"], call.kwargs["embeds"])
+            for call in interaction.followup.send.await_args_list
+        ]
+
     @pytest.mark.asyncio
     async def test_many_alerts_chunk_into_bounded_embeds(self, tmp_path):
+        # 30 alerts fit in one message (two embeds), each inside the limits.
         store = ReminderStore(db_path=tmp_path / "reminders.db")
         for index in range(30):
             store.add_reminder(42, 10, "NVDA", 100.0 + index, "above")
@@ -1556,7 +1583,11 @@ class TestRemindersCommand:
         with patch("bot.reminder_store", store):
             await reminders.callback(interaction)
 
-        embeds = interaction.followup.send.await_args.kwargs["embeds"]
+        interaction.response.defer.assert_awaited_once_with(thinking=True, ephemeral=True)
+        messages = self.sent_messages(interaction)
+        assert len(messages) == 1
+        assert all(ephemeral for ephemeral, _ in messages)
+        embeds = messages[0][1]
         assert len(embeds) == 2
         assert [len(embed.fields) for embed in embeds] == [
             REMINDER_FIELDS_PER_EMBED,
@@ -1564,6 +1595,83 @@ class TestRemindersCommand:
         ]
         for embed in embeds:
             assert len(embed.fields) <= 25
+
+    @pytest.mark.asyncio
+    async def test_251_alerts_split_across_multiple_messages(self, tmp_path):
+        # 251 alerts need 11 embeds: one full message of 10 embeds plus a
+        # second ephemeral message with one embed, in order.
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        for index in range(251):
+            store.add_reminder(42, 10, "NVDA", 100.0 + index, "above")
+        interaction = self.make_interaction()
+
+        with patch("bot.reminder_store", store):
+            await reminders.callback(interaction)
+
+        interaction.response.defer.assert_awaited_once_with(thinking=True, ephemeral=True)
+        messages = self.sent_messages(interaction)
+        assert len(messages) == 2
+        assert all(ephemeral for ephemeral, _ in messages)
+        assert [len(embeds) for _, embeds in messages] == [
+            REMINDER_EMBEDS_PER_MESSAGE,
+            1,
+        ]
+        assert all(len(embeds) <= 10 for _, embeds in messages)
+        assert all(
+            len(embed.fields) <= 25 for _, embeds in messages for embed in embeds
+        )
+
+        names = [
+            field.name
+            for _, embeds in messages
+            for embed in embeds
+            for field in embed.fields
+        ]
+        assert names[0] == "#1 NVDA"
+        assert names[-1] == "#251 NVDA"
+        assert len(names) == 251
+
+    @pytest.mark.asyncio
+    async def test_250_alerts_fill_exactly_ten_embeds_per_message(self, tmp_path):
+        # 250 alerts are exactly one message: 10 embeds of 25 fields each.
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        for index in range(250):
+            store.add_reminder(42, 10, "NVDA", 100.0 + index, "above")
+        interaction = self.make_interaction()
+
+        with patch("bot.reminder_store", store):
+            await reminders.callback(interaction)
+
+        messages = self.sent_messages(interaction)
+        assert len(messages) == 1
+        assert all(ephemeral for ephemeral, _ in messages)
+        assert [len(embeds) for _, embeds in messages] == [
+            REMINDER_EMBEDS_PER_MESSAGE
+        ]
+        assert all(
+            len(embed.fields) == 25 for _, embeds in messages for embed in embeds
+        )
+
+    @pytest.mark.asyncio
+    async def test_120_alerts_chunk_into_five_embeds_in_one_message(self, tmp_path):
+        # 120 alerts fit in one message as 5 embeds (25 fields each, last 20),
+        # in order.
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        for index in range(120):
+            store.add_reminder(42, 10, "NVDA", 100.0 + index, "above")
+        interaction = self.make_interaction()
+
+        with patch("bot.reminder_store", store):
+            await reminders.callback(interaction)
+
+        messages = self.sent_messages(interaction)
+        assert len(messages) == 1
+        assert all(ephemeral for ephemeral, _ in messages)
+        embeds = messages[0][1]
+        assert [len(embed.fields) for embed in embeds] == [25, 25, 25, 25, 20]
+        names = [field.name for embed in embeds for field in embed.fields]
+        assert names[0] == "#1 NVDA"
+        assert names[-1] == "#120 NVDA"
 
 
 class TestUnremindCommand:
@@ -1586,6 +1694,8 @@ class TestUnremindCommand:
         with patch("bot.reminder_store", store):
             await unremind.callback(interaction, reminder_id)
 
+        interaction.response.defer.assert_awaited_once_with(thinking=True, ephemeral=True)
+        interaction.followup.send.assert_awaited_once()
         assert "cancelled" in interaction.followup.send.await_args.args[0]
         assert interaction.followup.send.await_args.kwargs["ephemeral"] is True
         assert store.get_by_id(reminder_id) is None
@@ -1599,6 +1709,8 @@ class TestUnremindCommand:
         with patch("bot.reminder_store", store):
             await unremind.callback(interaction, reminder_id)
 
+        interaction.response.defer.assert_awaited_once_with(thinking=True, ephemeral=True)
+        interaction.followup.send.assert_awaited_once()
         assert "belongs to you" in interaction.followup.send.await_args.args[0]
         assert interaction.followup.send.await_args.kwargs["ephemeral"] is True
         assert store.get_by_id(reminder_id) is not None
@@ -1611,7 +1723,10 @@ class TestUnremindCommand:
         with patch("bot.reminder_store", store):
             await unremind.callback(interaction, 9999)
 
+        interaction.response.defer.assert_awaited_once_with(thinking=True, ephemeral=True)
+        interaction.followup.send.assert_awaited_once()
         assert "belongs to you" in interaction.followup.send.await_args.args[0]
+        assert interaction.followup.send.await_args.kwargs["ephemeral"] is True
 
 
 class TestPriceAlertsChecker:
@@ -1658,7 +1773,12 @@ class TestPriceAlertsChecker:
         assert "delayed / latest available" in content
         assert "not real-time" in content
         mentions = channel.send.await_args.kwargs["allowed_mentions"]
-        assert mentions.users is True
+        # Mentions are restricted to the owner's user ID exactly: no
+        # @everyone, @role or replied-user mentions can fire from the text.
+        assert mentions.users == [discord.Object(id=42)]
+        assert mentions.everyone is False
+        assert mentions.roles is False
+        assert mentions.replied_user is False
         assert store.get_by_id(reminder_id) is None
 
     @pytest.mark.asyncio
@@ -1893,12 +2013,49 @@ class TestPriceAlertsLoopLifecycle:
         out = capsys.readouterr().out
         assert "price alert cycle failed: RuntimeError" in out
 
+    @staticmethod
+    def make_bot():
+        """A bot instance that can be closed without any network access."""
+        return bot_module.StockPriceBot(
+            command_prefix="!", intents=discord.Intents.default()
+        )
+
     @pytest.mark.asyncio
-    async def test_on_close_cancels_the_loop(self):
-        with patch("bot.price_alerts_loop.cancel") as cancel_mock:
-            await on_close()
+    async def test_close_cancels_the_loop_and_awaits_super_close(self):
+        test_bot = self.make_bot()
+        with patch("bot.price_alerts_loop.cancel") as cancel_mock, patch(
+            "discord.ext.commands.Bot.close", new=AsyncMock()
+        ) as close_mock:
+            await test_bot.close()
 
         cancel_mock.assert_called_once()
+        close_mock.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_close_is_idempotent_when_the_bot_never_started(self):
+        # Closing a bot that never connected (loop never started) must still
+        # cancel the loop and await super's close, and repeat safely.
+        test_bot = self.make_bot()
+        with patch("bot.price_alerts_loop.cancel") as cancel_mock, patch(
+            "discord.ext.commands.Bot.close", new=AsyncMock()
+        ) as close_mock:
+            await test_bot.close()
+            await test_bot.close()
+
+        assert cancel_mock.call_count == 2
+        assert close_mock.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_close_does_not_restart_the_loop(self):
+        # Shutdown must never start the loop again (no double start after a
+        # reconnect/restart).
+        test_bot = self.make_bot()
+        with patch("bot.price_alerts_loop.cancel"), patch(
+            "discord.ext.commands.Bot.close", new=AsyncMock()
+        ), patch("bot.price_alerts_loop.start") as start_mock:
+            await test_bot.close()
+
+        start_mock.assert_not_called()
 
 
 if __name__ == "__main__":
