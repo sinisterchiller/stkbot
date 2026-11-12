@@ -2,6 +2,8 @@
 
 A single-file Discord bot that responds to `/price <ticker>` with the latest available stock price from pre-market, regular and after-hours sessions, the daily change versus the previous trading close, and a dark 1-day 5-minute chart of that same extended-hours session.
 
+See [CHANGELOG.md](CHANGELOG.md) for the extended-hours update and release history.
+
 ## Features
 
 - **Slash command**: `/price NVDA` (case-insensitive, normalized to uppercase)
