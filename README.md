@@ -192,7 +192,7 @@ The bot responds with an embed showing:
 /help
 ```
 
-`/help` responds privately (ephemeral) with a short guide to every command — `/price <ticker>`, `/remind <ticker> <target>`, `/reminders` and `/unremind <id>` — plus the key behaviours: the alert direction is chosen automatically, alerts are one-shot and mention you in the channel where you created them, pending alerts are checked once every 60 seconds, and Yahoo data can be delayed and is not real-time. Your alerts are never shown to the channel.
+`/help` responds privately (ephemeral) with a short guide to every command — `/price <ticker>`, `/remind <ticker> <target>`, `/reminders` and `/unremind <id>` — plus the key behaviours: the alert direction is chosen automatically, alerts are one-shot and mention you in the channel where you created them, pending alerts are checked once every 60 seconds, and Yahoo data can be delayed and is not real-time. Only this guide and the reminder confirmations, lists and cancellations are private (ephemeral): `/price` answers are posted publicly in the channel, and fired alerts are posted in the channel where you created them with a mention of you.
 
 ### Price alerts
 

@@ -1880,7 +1880,11 @@ class TestUnremindCommand:
 
 
 class TestHelpCommand:
-    """/help: private command guide with accurate, in-limit content."""
+    """/help: private command guide with accurate, in-limit content.
+
+    The guide itself, reminder confirmations and pending lists are ephemeral,
+    while /price answers and fired alerts are public in the channel.
+    """
 
     @staticmethod
     def make_interaction():
@@ -1940,10 +1944,35 @@ class TestHelpCommand:
         # Delayed / not real-time data caveat.
         assert "delayed" in lowered
         assert "not real-time" in lowered
-        # IDs come from /reminders; responses stay private.
+        # IDs come from /reminders; the guide itself is ephemeral.
         assert "alert ids" in lowered
         assert "ephemeral" in lowered
-        assert "never shown to the channel" in lowered
+
+    @pytest.mark.asyncio
+    async def test_help_states_the_privacy_distinction(self):
+        """The guide distinguishes private management from public /price and fired alerts."""
+        interaction = self.make_interaction()
+
+        await help.callback(interaction)
+
+        embed = interaction.response.send.await_args.kwargs["embed"]
+        lowered = self.embed_text(embed).lower()
+        # The guide itself, and reminder confirmations/lists, are private.
+        assert "private" in lowered
+        assert "ephemeral" in lowered
+        assert "confirmations" in lowered
+        assert "privately" in lowered
+        # /price answers are public in the invoking channel.
+        price_field = next(f for f in embed.fields if f.name.startswith("/price"))
+        assert "public" in price_field.value.lower()
+        assert "channel" in price_field.value.lower()
+        # Fired alerts post in the creating channel and mention the owner.
+        description = (embed.description or "").lower()
+        assert "fired alerts" in description
+        assert "mentioning you" in description
+        # Stale blanket claims must be gone.
+        assert "every response is private" not in lowered
+        assert "never shown" not in lowered
 
     @pytest.mark.asyncio
     async def test_help_embed_stays_within_discord_limits(self):

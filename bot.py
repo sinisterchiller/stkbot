@@ -1232,16 +1232,18 @@ def _build_help_embed() -> discord.Embed:
     embed = discord.Embed(
         title="Stock bot commands",
         description=(
-            "Every response is private (ephemeral): only you can see it, and "
-            "your alerts are never shown to the channel."
+            "This guide, and reminder confirmations and lists, are private "
+            "(ephemeral). /price answers are public in the channel, and fired "
+            "alerts post in the channel where you created them, mentioning you."
         ),
         color=discord.Color.blue(),
     )
     embed.add_field(
         name="/price <ticker>",
         value=(
-            "Latest extended-hours price with a 1-day, 5-minute chart. Data "
-            "comes from Yahoo Finance and can be delayed — not real-time."
+            "Latest extended-hours price with a 1-day, 5-minute chart, posted "
+            "publicly in the channel. Data comes from Yahoo Finance and can be "
+            "delayed — not real-time."
         ),
         inline=False,
     )
