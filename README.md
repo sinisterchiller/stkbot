@@ -1,12 +1,13 @@
 # Discord Stock Price Bot
 
-A single-file Discord bot that responds to `/price <ticker>` with the latest available stock price from pre-market, regular and after-hours sessions, the daily change versus the previous trading close, and a dark 1-day 5-minute chart of that same extended-hours session. It also supports one-shot stock price alerts: `/remind`, `/reminders` and `/unremind`, checked once every 60 seconds by a background task.
+A single-file Discord bot that responds to `/price <ticker>` with the latest available stock price from pre-market, regular and after-hours sessions, the daily change versus the previous trading close, and a dark 1-day 5-minute chart of that same extended-hours session. It also supports one-shot stock price alerts: `/remind`, `/reminders` and `/unremind`, checked once every 60 seconds by a background task. A `/help` command privately lists every command and how alerts work.
 
 See [CHANGELOG.md](CHANGELOG.md) for the extended-hours update and release history.
 
 ## Features
 
 - **Slash command**: `/price NVDA` (case-insensitive, normalized to uppercase)
+- **`/help`**: a private (ephemeral) guide listing `/price`, `/remind`, `/reminders`, `/unremind` and the key alert behaviours — direction auto-selection, one-shot alerts, 60-second checks, the owner being mentioned in the creating channel, and delayed / not-real-time Yahoo data
 - **Latest price**: Most recent valid 1-minute close from Yahoo Finance 5-day extended-hours (`prepost=True`) data, spanning pre-market, regular and after-hours sessions; labeled as delayed / latest available, never claimed as real-time
 - **Daily change**: Dollar and percentage change against the latest valid daily close strictly before the quote's exchange-local session date (a pre-market quote on a new day uses the previous regular day's close; an after-hours quote on the same day uses the previous day's close)
 - **Closed markets**: Uses a 10-day daily lookback instead of blindly taking the second-to-last row, and falls back to `info.previousClose` when daily history is unavailable
@@ -184,6 +185,14 @@ The bot responds with an embed showing:
 - Previous trading close for reference
 - Exchange-local data timestamp from the quote bar, labeled as delayed / latest available
 - Dark 1-day 5-minute extended-hours chart as an attachment, covering pre-market, regular and after-hours and ending at the latest quote point (omitted when it cannot be derived)
+
+### Help
+
+```
+/help
+```
+
+`/help` responds privately (ephemeral) with a short guide to every command — `/price <ticker>`, `/remind <ticker> <target>`, `/reminders` and `/unremind <id>` — plus the key behaviours: the alert direction is chosen automatically, alerts are one-shot and mention you in the channel where you created them, pending alerts are checked once every 60 seconds, and Yahoo data can be delayed and is not real-time. Your alerts are never shown to the channel.
 
 ### Price alerts
 

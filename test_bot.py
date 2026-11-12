@@ -24,6 +24,7 @@ from bot import (
     fetch_latest_price,
     fetch_quote,
     generate_chart,
+    help,
     parse_guild_id,
     price,
     price_alerts_loop,
@@ -1099,6 +1100,11 @@ class TestCommandRegistration:
 
         run_mock.assert_called_once_with("test-token")
 
+    def test_command_tree_registers_all_five_commands(self):
+        # The real bot tree must expose every slash command, including /help.
+        names = sorted(command.name for command in bot_module.bot.tree.get_commands())
+        assert names == ["help", "price", "remind", "reminders", "unremind"]
+
 
 class TestAutomaticGuildSync:
     """Automatic per-guild registration on ready, join and reconnect."""
@@ -1871,6 +1877,88 @@ class TestUnremindCommand:
         interaction.followup.send.assert_awaited_once()
         assert "belongs to you" in interaction.followup.send.await_args.args[0]
         assert interaction.followup.send.await_args.kwargs["ephemeral"] is True
+
+
+class TestHelpCommand:
+    """/help: private command guide with accurate, in-limit content."""
+
+    @staticmethod
+    def make_interaction():
+        interaction = MagicMock()
+        interaction.response.send = AsyncMock()
+        interaction.response.defer = AsyncMock()
+        interaction.followup.send = AsyncMock()
+        return interaction
+
+    @staticmethod
+    def embed_text(embed):
+        parts = [embed.title, embed.description]
+        parts += [f.name for f in embed.fields]
+        parts += [f.value for f in embed.fields]
+        return " ".join(part for part in parts if part)
+
+    @pytest.mark.asyncio
+    async def test_help_sends_private_embed_without_defer(self):
+        interaction = self.make_interaction()
+
+        await help.callback(interaction)
+
+        interaction.response.defer.assert_not_awaited()
+        interaction.response.send.assert_awaited_once()
+        kwargs = interaction.response.send.await_args.kwargs
+        assert kwargs["ephemeral"] is True
+        assert kwargs["embed"] is not None
+
+    @pytest.mark.asyncio
+    async def test_help_lists_every_command(self):
+        interaction = self.make_interaction()
+
+        await help.callback(interaction)
+
+        embed = interaction.response.send.await_args.kwargs["embed"]
+        names = [field.name for field in embed.fields]
+        assert "/price <ticker>" in names
+        assert "/remind <ticker> <target>" in names
+        assert "/reminders" in names
+        assert "/unremind <id>" in names
+
+    @pytest.mark.asyncio
+    async def test_help_describes_the_important_behaviours(self):
+        interaction = self.make_interaction()
+
+        await help.callback(interaction)
+
+        text = self.embed_text(interaction.response.send.await_args.kwargs["embed"])
+        lowered = text.lower()
+        # Direction auto-selection, one-shot alerts, 60-second checking.
+        assert "above/below" in lowered
+        assert "one-shot" in lowered
+        assert "60 seconds" in text
+        # Alerts mention the owner in the creating channel.
+        assert "mentions you" in lowered
+        assert "channel where you created it" in lowered
+        # Delayed / not real-time data caveat.
+        assert "delayed" in lowered
+        assert "not real-time" in lowered
+        # IDs come from /reminders; responses stay private.
+        assert "alert ids" in lowered
+        assert "ephemeral" in lowered
+        assert "never shown to the channel" in lowered
+
+    @pytest.mark.asyncio
+    async def test_help_embed_stays_within_discord_limits(self):
+        interaction = self.make_interaction()
+
+        await help.callback(interaction)
+
+        embed = interaction.response.send.await_args.kwargs["embed"]
+        assert len(embed.fields) <= REMINDER_FIELDS_PER_EMBED
+        total = len(embed.title) + len(embed.description)
+        total += sum(len(field.name) + len(field.value) for field in embed.fields)
+        for field in embed.fields:
+            assert len(field.name) <= 256
+            assert len(field.value) <= 1024
+        assert total <= REMINDER_EMBED_CHAR_BUDGET
 
 
 class TestPriceAlertsChecker:

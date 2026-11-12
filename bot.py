@@ -1,8 +1,8 @@
 """Discord stock price bot with /price and one-shot price alerts.
 
-Slash commands: /price, /remind, /reminders, /unremind. A background task
-checks pending alerts once every 60 seconds and notifies their owners in the
-original guild channel; alerts persist in a local SQLite database.
+Slash commands: /price, /remind, /reminders, /unremind and /help. A background
+task checks pending alerts once every 60 seconds and notifies their owners in
+the original guild channel; alerts persist in a local SQLite database.
 """
 
 import asyncio
@@ -1220,6 +1220,73 @@ async def unremind(interaction: discord.Interaction, id: int):
             f"❌ No pending alert with ID {id} belongs to you. Check /reminders.",
             ephemeral=True,
         )
+
+
+def _build_help_embed() -> discord.Embed:
+    """The private /help guide: one field per command plus a how-alerts-work note.
+
+    Field names and values are static and short, so every field stays well
+    inside Discord's 256-character name and 1024-character value limits and
+    the whole embed stays inside the 6000-character embed cap.
+    """
+    embed = discord.Embed(
+        title="Stock bot commands",
+        description=(
+            "Every response is private (ephemeral): only you can see it, and "
+            "your alerts are never shown to the channel."
+        ),
+        color=discord.Color.blue(),
+    )
+    embed.add_field(
+        name="/price <ticker>",
+        value=(
+            "Latest extended-hours price with a 1-day, 5-minute chart. Data "
+            "comes from Yahoo Finance and can be delayed — not real-time."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="/remind <ticker> <target>",
+        value=(
+            "Set a one-shot price alert (server channels only). The direction "
+            "(above/below) is chosen automatically from the current price, and "
+            "you get a private confirmation with the alert ID."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="/reminders",
+        value=(
+            "List only your pending alerts, privately. This is where you get "
+            "the alert IDs used by /unremind."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="/unremind <id>",
+        value="Cancel one of your alerts using the ID shown by /reminders.",
+        inline=False,
+    )
+    embed.add_field(
+        name="How alerts work",
+        value=(
+            "Checked once every 60 seconds; each alert fires exactly once and "
+            "mentions you in the channel where you created it. Yahoo data can "
+            "be delayed and is not real-time."
+        ),
+        inline=False,
+    )
+    return embed
+
+
+@bot.tree.command(name="help", description="Show how to use this bot's commands")
+async def help(interaction: discord.Interaction):
+    """Slash command that privately explains every command and how alerts work.
+
+    The response is ephemeral, so it is visible only to the invoking user and
+    can never leak one user's alerts or details to the channel.
+    """
+    await interaction.response.send(embed=_build_help_embed(), ephemeral=True)
 
 
 def main():
