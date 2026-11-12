@@ -53,8 +53,10 @@ git checkout --detach "$DEPLOY_SHA"
 "$DEPLOY_DIR/.venv/bin/pip" --quiet install -r requirements.txt \
   || fail "pip install -r requirements.txt failed"
 
-# Tests must pass BEFORE the service is restarted.
-PYTHONDONTWRITEBYTECODE=1 "$DEPLOY_DIR/.venv/bin/python" -m pytest -p no:cache -q test_bot.py \
+# Both test suites (bot and SQLite storage) must pass BEFORE the service is
+# restarted; any failure aborts the deploy without touching the service.
+PYTHONDONTWRITEBYTECODE=1 "$DEPLOY_DIR/.venv/bin/python" -m pytest -p no:cache -q \
+  test_bot.py test_reminders.py \
   || { diagnose_service; fail "tests failed; stkbot.service was not restarted"; }
 
 # Restart the user-level service (same systemd --user scope as the runner).

@@ -7,7 +7,9 @@ releases; this file records what changed on `dev` before it was merged into
 ## Unreleased — `dev-feature-price-alerts` merged into `main` (2026-11-11)
 
 This merge brings one-shot stock price alerts and a private `/help` guide
-from `dev-feature-price-alerts` (`723000d..45be3ca`) onto `main`. Everything
+from `dev-feature-price-alerts` (previous `main` baseline `723000d` through
+the DB-permission hardening commit `613b06e`, plus this follow-up
+documentation fix) onto `main`. Everything
 below is a change relative to the previous `main` commit `723000d`; the
 baseline behavior that already existed on `main` is listed separately at
 the end.
@@ -66,9 +68,9 @@ the end.
   notification message has been sent successfully; any channel-lookup, quote
   fetch or send failure retains the reminder for the next cycle.
 - **Expanded tests.** The suite grew from 61 test functions (96 collected
-  test cases) on the previous `main` baseline to 138 test functions (174
+  test cases) on the previous `main` baseline to 141 test functions (177
   collected test cases including parameterization): 115 in `test_bot.py` and
-  23 in the new `test_reminders.py`. New coverage includes the lightweight
+  26 in the new `test_reminders.py`. New coverage includes the lightweight
   quote helper (exactly one 5d/1m fetch), `/remind` validation (invalid
   ticker, non-positive target, DM channel, equal current price, executor
   threading) and persistence, `/reminders` owner-only listing with embed
@@ -79,7 +81,10 @@ the end.
   `get_channel`→`fetch_channel` fallback, persistence across a simulated
   restart, loop started exactly once, ready guard and clean stop on close),
   and the SQLite storage layer (schema, validation, user isolation,
-  owner-checked and ID-only deletes).
+  owner-checked and ID-only deletes, plus `reminders.db` file-permission
+  hardening: owner-only `0600` on the database and its `-wal`/`-shm`/
+  `-journal` sidecars, symlinked-path rejection, and a database file that
+  cannot be chmod-ed raising instead of continuing).
 
 ### Changed
 
@@ -140,7 +145,9 @@ the end.
 | `4731e4d` | Size /reminders embed batches to Discord's 6000-character embed limits |
 | `2163ec2` | Private /help slash command with tests and README docs |
 | `a30c110` | Correct /help privacy claims to match actual visibility |
-| `7f1af9c` | Fix /help crash: use InteractionResponse.send_message |
+| `7f1af9c` | Fix /help crash: use InteractionResponse.send_message (real discord.py API) |
+| `45be3ca` | Docs: detailed changelog for price-alert and /help release |
+| `613b06e` | Harden reminders.db file permissions to owner-only 0600 |
 
 ### Baseline already on `main` before this merge
 
