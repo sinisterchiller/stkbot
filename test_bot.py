@@ -14,13 +14,22 @@ from discord import app_commands
 
 import bot as bot_module
 from bot import (
+    REMINDER_FIELDS_PER_EMBED,
     TICKER_PATTERN,
+    check_price_alerts,
+    fetch_latest_price,
     fetch_quote,
     generate_chart,
+    on_close,
     parse_guild_id,
     price,
+    price_alerts_loop,
+    remind,
+    reminders,
     sync_commands,
+    unremind,
 )
+from reminders import ReminderStore
 
 
 class FakeTicker:
@@ -1049,7 +1058,10 @@ class TestCommandRegistration:
     @pytest.mark.asyncio
     async def test_setup_hook_registers_commands_once(self, monkeypatch):
         monkeypatch.delenv("DISCORD_GUILD_ID", raising=False)
-        with patch("bot.sync_commands", new=AsyncMock(return_value=True)) as sync_mock:
+        bot_module.bot._price_alerts_started = False
+        with patch("bot.sync_commands", new=AsyncMock(return_value=True)) as sync_mock, patch(
+            "bot.price_alerts_loop.start"
+        ):
             await bot_module.bot.setup_hook()
 
         sync_mock.assert_awaited_once_with(bot_module.bot.tree)
@@ -1132,11 +1144,11 @@ class TestAutomaticGuildSync:
             await bot_module.on_ready()
 
         assert [call.kwargs["guild"].id for call in sync_mock.await_args_list] == [111, 222]
-        # copy_global_to ran first, so each guild holds its own price copy.
+        # copy_global_to ran first, so each guild holds its own copy of every
+        # global command.
+        expected = [command.name for command in bot_module.bot.tree.get_commands()]
         for guild in guilds:
-            assert [command.name for command in bot_module.bot.tree.get_commands(guild=guild)] == [
-                "price"
-            ]
+            assert [command.name for command in bot_module.bot.tree.get_commands(guild=guild)] == expected
 
         out = capsys.readouterr().out
         assert "Registered slash commands in 2 guild(s): 111, 222" in out
@@ -1168,9 +1180,10 @@ class TestAutomaticGuildSync:
             await bot_module.on_guild_join(guild)
 
         assert [call.kwargs["guild"].id for call in sync_mock.await_args_list] == [333]
+        expected = [command.name for command in bot_module.bot.tree.get_commands()]
         assert [
             command.name for command in bot_module.bot.tree.get_commands(guild=guild)
-        ] == ["price"]
+        ] == expected
         assert 333 in bot_module.bot._synced_guild_ids
 
     @pytest.mark.asyncio
@@ -1288,6 +1301,604 @@ class TestAutomaticGuildSync:
         clear_mock.assert_not_called()
         assert all("guild" in call.kwargs for call in sync_mock.await_args_list)
         assert [command.name for command in test_bot.tree.get_commands()] == ["price"]
+
+
+class TestFetchLatestPrice:
+    """Lightweight quote helper: one 5d/1m fetch, no info/daily/chart calls."""
+
+    def test_returns_latest_valid_price_and_timestamp(self):
+        ext = extended_frame()
+        fake = FakeTicker(ext, None, None)
+
+        with patch("bot.yf.Ticker", return_value=fake):
+            result = fetch_latest_price("NVDA")
+
+        assert result is not None
+        assert result.price == pytest.approx(148.5)
+        assert result.timestamp == ext.index[-1]
+        # Exactly one lightweight fetch: 5d/1m prepost, no daily history.
+        assert fake.history_calls == [("5d", "1m", True, False)]
+
+    def test_trailing_invalid_bar_uses_last_valid_one(self):
+        ext = pd.DataFrame(
+            {"Close": [147.0, 148.0, np.nan]},
+            index=pd.date_range("2024-01-12 15:57", periods=3, freq="1min", tz="America/New_York"),
+        )
+        fake = FakeTicker(ext, None, None)
+
+        with patch("bot.yf.Ticker", return_value=fake):
+            result = fetch_latest_price("TEST")
+
+        assert result is not None
+        assert result.price == pytest.approx(148.0)
+        assert result.timestamp == ext.index[1]
+
+    @pytest.mark.parametrize(
+        "ext",
+        [
+            pd.DataFrame(),
+            pd.DataFrame({"Close": [np.nan, np.nan]}, index=pd.date_range("2024-01-12", periods=2, freq="1min", tz="UTC")),
+            pd.DataFrame({"Close": [-1.0, 0.0]}, index=pd.date_range("2024-01-12", periods=2, freq="1min", tz="UTC")),
+            None,
+        ],
+    )
+    def test_unusable_data_returns_none(self, ext):
+        fake = FakeTicker(ext, None, None)
+
+        with patch("bot.yf.Ticker", return_value=fake):
+            assert fetch_latest_price("BAD") is None
+
+    def test_history_exception_returns_none(self):
+        fake = FakeTicker(None, None, None, extended_error=RuntimeError("Yahoo unavailable"))
+
+        with patch("bot.yf.Ticker", return_value=fake):
+            assert fetch_latest_price("ERROR") is None
+
+    def test_ticker_constructor_exception_returns_none(self):
+        with patch("bot.yf.Ticker", side_effect=RuntimeError("network down")):
+            assert fetch_latest_price("ERROR") is None
+
+
+class TestRemindCommand:
+    """/remind: validation, direction, persistence and ephemeral confirmation."""
+
+    @staticmethod
+    def make_interaction(user_id=42, channel_id=10, guild_id=111):
+        interaction = MagicMock()
+        interaction.user = SimpleNamespace(id=user_id)
+        interaction.channel = SimpleNamespace(
+            id=channel_id, guild=SimpleNamespace(id=guild_id) if guild_id is not None else None
+        )
+        interaction.response.defer = AsyncMock()
+        interaction.followup.send = AsyncMock()
+        return interaction
+
+    @staticmethod
+    def ok_fake():
+        return FakeTicker(extended_frame(), None, None)
+
+    @pytest.mark.asyncio
+    async def test_success_saves_alert_and_confirms_ephemeral(self, tmp_path):
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        interaction = self.make_interaction()
+
+        with patch("bot.yf.Ticker", return_value=self.ok_fake()), patch(
+            "bot.reminder_store", store
+        ):
+            await remind.callback(interaction, " nvda ", 150.0)
+
+        interaction.response.defer.assert_awaited_once_with(thinking=True)
+        interaction.followup.send.assert_awaited_once()
+        kwargs = interaction.followup.send.await_args.kwargs
+        assert kwargs["ephemeral"] is True
+
+        rows = store.list_by_user(42)
+        assert len(rows) == 1
+        assert rows[0]["ticker"] == "NVDA"
+        assert rows[0]["target_price"] == 150.0
+        assert rows[0]["direction"] == "above"
+        assert rows[0]["channel_id"] == 10
+
+        embed = kwargs["embed"]
+        assert str(rows[0]["id"]) in embed.title
+        values = {field.name: field.value for field in embed.fields}
+        assert values["Ticker"] == "NVDA"
+        assert values["Target"] == "$150.00"
+        assert values["Current"] == "$148.50"
+        assert values["Direction"] == "above"
+        # Timestamp plus delayed caveat, no real-time claim.
+        assert "16:05" in embed.description
+        assert "delayed / latest available" in embed.description
+
+    @pytest.mark.asyncio
+    async def test_lower_target_sets_below_direction(self, tmp_path):
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        interaction = self.make_interaction()
+
+        with patch("bot.yf.Ticker", return_value=self.ok_fake()), patch(
+            "bot.reminder_store", store
+        ):
+            await remind.callback(interaction, "NVDA", 140.0)
+
+        rows = store.list_by_user(42)
+        assert rows[0]["direction"] == "below"
+
+    @pytest.mark.asyncio
+    async def test_target_equal_to_current_price_is_rejected(self, tmp_path):
+        # The stale-price guard: a target at the current displayed price
+        # cannot be created, so it cannot auto-fire on that stale value.
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        interaction = self.make_interaction()
+
+        with patch("bot.yf.Ticker", return_value=self.ok_fake()), patch(
+            "bot.reminder_store", store
+        ):
+            await remind.callback(interaction, "NVDA", 148.50)
+
+        interaction.followup.send.assert_awaited_once()
+        assert interaction.followup.send.await_args.kwargs["ephemeral"] is True
+        assert "already trading at" in interaction.followup.send.await_args.args[0]
+        assert store.list_all() == []
+
+    @pytest.mark.asyncio
+    async def test_invalid_ticker_rejected_before_fetching(self):
+        interaction = self.make_interaction()
+
+        with patch("bot.yf.Ticker") as ticker_mock, patch(
+            "bot.reminder_store", MagicMock()
+        ):
+            await remind.callback(interaction, "bad ticker!", 150.0)
+
+        ticker_mock.assert_not_called()
+        assert "not a valid ticker" in interaction.followup.send.await_args.args[0]
+        assert interaction.followup.send.await_args.kwargs["ephemeral"] is True
+
+    @pytest.mark.asyncio
+    async def test_non_positive_target_rejected_before_fetching(self):
+        interaction = self.make_interaction()
+
+        with patch("bot.yf.Ticker") as ticker_mock, patch(
+            "bot.reminder_store", MagicMock()
+        ):
+            await remind.callback(interaction, "NVDA", -5.0)
+
+        ticker_mock.assert_not_called()
+        assert "positive number" in interaction.followup.send.await_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_dm_channel_rejected_without_saving(self, tmp_path):
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        interaction = self.make_interaction(guild_id=None)
+
+        with patch("bot.yf.Ticker") as ticker_mock, patch(
+            "bot.reminder_store", store
+        ):
+            await remind.callback(interaction, "NVDA", 150.0)
+
+        ticker_mock.assert_not_called()
+        assert store.list_all() == []
+        assert "server channels" in interaction.followup.send.await_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_fetch_failure_does_not_save(self, tmp_path):
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        fake = FakeTicker(None, None, None, extended_error=RuntimeError("Yahoo unavailable"))
+        interaction = self.make_interaction()
+
+        with patch("bot.yf.Ticker", return_value=fake), patch("bot.reminder_store", store):
+            await remind.callback(interaction, "NVDA", 150.0)
+
+        assert store.list_all() == []
+        assert "Could not fetch a latest price" in interaction.followup.send.await_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_fetch_and_store_run_off_the_event_loop(self, tmp_path):
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        fake = self.ok_fake()
+        interaction = self.make_interaction()
+
+        with patch("bot.yf.Ticker", return_value=fake), patch("bot.reminder_store", store):
+            await remind.callback(interaction, "NVDA", 150.0)
+
+        assert fake.history_thread_ids[0] != threading.get_ident()
+        assert len(store.list_by_user(42)) == 1
+
+
+class TestRemindersCommand:
+    """/reminders: owner-only listing, empty list and embed chunking."""
+
+    @staticmethod
+    def make_interaction(user_id=42):
+        interaction = MagicMock()
+        interaction.user = SimpleNamespace(id=user_id)
+        interaction.response.defer = AsyncMock()
+        interaction.followup.send = AsyncMock()
+        return interaction
+
+    @pytest.mark.asyncio
+    async def test_empty_list_is_friendly_ephemeral(self, tmp_path):
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        interaction = self.make_interaction()
+
+        with patch("bot.reminder_store", store):
+            await reminders.callback(interaction)
+
+        interaction.followup.send.assert_awaited_once()
+        assert interaction.followup.send.await_args.kwargs["ephemeral"] is True
+        assert "no pending price alerts" in interaction.followup.send.await_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_lists_only_the_invoking_users_alerts(self, tmp_path):
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        store.add_reminder(42, 10, "NVDA", 100.0, "above")
+        store.add_reminder(42, 10, "AAPL", 200.0, "below")
+        store.add_reminder(99, 10, "TSLA", 300.0, "above")  # other user
+        interaction = self.make_interaction(user_id=42)
+
+        with patch("bot.reminder_store", store):
+            await reminders.callback(interaction)
+
+        kwargs = interaction.followup.send.await_args.kwargs
+        assert kwargs["ephemeral"] is True
+        embeds = kwargs["embeds"]
+        fields = [(field.name, field.value) for embed in embeds for field in embed.fields]
+        assert ("#1 NVDA", "$100.00 (above)") in fields
+        assert ("#2 AAPL", "$200.00 (below)") in fields
+        assert not any(name.startswith("#3") for name, _ in fields)
+
+    @pytest.mark.asyncio
+    async def test_many_alerts_chunk_into_bounded_embeds(self, tmp_path):
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        for index in range(30):
+            store.add_reminder(42, 10, "NVDA", 100.0 + index, "above")
+        interaction = self.make_interaction()
+
+        with patch("bot.reminder_store", store):
+            await reminders.callback(interaction)
+
+        embeds = interaction.followup.send.await_args.kwargs["embeds"]
+        assert len(embeds) == 2
+        assert [len(embed.fields) for embed in embeds] == [
+            REMINDER_FIELDS_PER_EMBED,
+            30 - REMINDER_FIELDS_PER_EMBED,
+        ]
+        for embed in embeds:
+            assert len(embed.fields) <= 25
+
+
+class TestUnremindCommand:
+    """/unremind: owner-only cancellation."""
+
+    @staticmethod
+    def make_interaction(user_id=42):
+        interaction = MagicMock()
+        interaction.user = SimpleNamespace(id=user_id)
+        interaction.response.defer = AsyncMock()
+        interaction.followup.send = AsyncMock()
+        return interaction
+
+    @pytest.mark.asyncio
+    async def test_owner_can_cancel(self, tmp_path):
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        reminder_id = store.add_reminder(42, 10, "NVDA", 100.0, "above")
+        interaction = self.make_interaction(user_id=42)
+
+        with patch("bot.reminder_store", store):
+            await unremind.callback(interaction, reminder_id)
+
+        assert "cancelled" in interaction.followup.send.await_args.args[0]
+        assert interaction.followup.send.await_args.kwargs["ephemeral"] is True
+        assert store.get_by_id(reminder_id) is None
+
+    @pytest.mark.asyncio
+    async def test_cross_user_cancellation_prevented(self, tmp_path):
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        reminder_id = store.add_reminder(42, 10, "NVDA", 100.0, "above")
+        interaction = self.make_interaction(user_id=99)
+
+        with patch("bot.reminder_store", store):
+            await unremind.callback(interaction, reminder_id)
+
+        assert "belongs to you" in interaction.followup.send.await_args.args[0]
+        assert interaction.followup.send.await_args.kwargs["ephemeral"] is True
+        assert store.get_by_id(reminder_id) is not None
+
+    @pytest.mark.asyncio
+    async def test_unknown_id_reports_failure(self, tmp_path):
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        interaction = self.make_interaction()
+
+        with patch("bot.reminder_store", store):
+            await unremind.callback(interaction, 9999)
+
+        assert "belongs to you" in interaction.followup.send.await_args.args[0]
+
+
+class TestPriceAlertsChecker:
+    """60-second cycle: unique quotes, one-shot notify, safe failures, persistence."""
+
+    @staticmethod
+    def make_channel(channel_id=10, guild_id=111, send=None):
+        channel = MagicMock()
+        channel.id = channel_id
+        channel.guild = SimpleNamespace(id=guild_id) if guild_id is not None else None
+        channel.send = send if send is not None else AsyncMock()
+        return channel
+
+    @staticmethod
+    def ticker_factory(payloads):
+        """yf.Ticker stand-in keyed by symbol; missing symbols look unavailable."""
+
+        def factory(ticker):
+            extended = payloads.get(ticker)
+            if extended is None:
+                return FakeTicker(
+                    None, None, None, extended_error=RuntimeError("Yahoo unavailable")
+                )
+            return FakeTicker(extended, None, None)
+
+        return factory
+
+    @pytest.mark.asyncio
+    async def test_due_alert_notifies_owner_and_deletes(self, tmp_path):
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        reminder_id = store.add_reminder(42, 10, "NVDA", 100.0, "above")
+        channel = self.make_channel()
+
+        with patch("bot.reminder_store", store), patch(
+            "bot.yf.Ticker", return_value=FakeTicker(extended_frame(), None, None)
+        ), patch.object(bot_module.bot, "get_channel", return_value=channel):
+            await check_price_alerts()
+
+        channel.send.assert_awaited_once()
+        content = channel.send.await_args.args[0]
+        assert "<@42>" in content
+        assert "NVDA" in content
+        assert "16:05" in content
+        assert "delayed / latest available" in content
+        assert "not real-time" in content
+        mentions = channel.send.await_args.kwargs["allowed_mentions"]
+        assert mentions.users is True
+        assert store.get_by_id(reminder_id) is None
+
+    @pytest.mark.asyncio
+    async def test_upward_alert_below_target_is_retained(self, tmp_path):
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        store.add_reminder(42, 10, "NVDA", 150.0, "above")  # price 148.5 < 150
+        channel = self.make_channel()
+
+        with patch("bot.reminder_store", store), patch(
+            "bot.yf.Ticker", return_value=FakeTicker(extended_frame(), None, None)
+        ), patch.object(bot_module.bot, "get_channel", return_value=channel):
+            await check_price_alerts()
+
+        channel.send.assert_not_awaited()
+        assert store.list_all() != []
+
+    @pytest.mark.asyncio
+    async def test_downward_alert_fires_when_price_at_or_below_target(self, tmp_path):
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        reminder_id = store.add_reminder(42, 10, "NVDA", 149.0, "below")  # 148.5 <= 149
+        channel = self.make_channel()
+
+        with patch("bot.reminder_store", store), patch(
+            "bot.yf.Ticker", return_value=FakeTicker(extended_frame(), None, None)
+        ), patch.object(bot_module.bot, "get_channel", return_value=channel):
+            await check_price_alerts()
+
+        channel.send.assert_awaited_once()
+        assert store.get_by_id(reminder_id) is None
+
+    @pytest.mark.asyncio
+    async def test_equal_price_triggers_per_spec_comparison(self, tmp_path):
+        # Checker comparisons are >=/<=; equal targets fire. The stale-price
+        # guarantee comes from /remind refusing to create such an alert.
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        reminder_id = store.add_reminder(42, 10, "NVDA", 148.5, "above")
+        channel = self.make_channel()
+
+        with patch("bot.reminder_store", store), patch(
+            "bot.yf.Ticker", return_value=FakeTicker(extended_frame(), None, None)
+        ), patch.object(bot_module.bot, "get_channel", return_value=channel):
+            await check_price_alerts()
+
+        channel.send.assert_awaited_once()
+        assert store.get_by_id(reminder_id) is None
+
+    @pytest.mark.asyncio
+    async def test_notification_happens_only_once(self, tmp_path):
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        store.add_reminder(42, 10, "NVDA", 100.0, "above")
+        channel = self.make_channel()
+
+        with patch("bot.reminder_store", store), patch(
+            "bot.yf.Ticker", return_value=FakeTicker(extended_frame(), None, None)
+        ), patch.object(bot_module.bot, "get_channel", return_value=channel):
+            await check_price_alerts()
+            await check_price_alerts()  # next cycle: nothing pending
+
+        assert channel.send.await_count == 1
+        assert store.list_all() == []
+
+    @pytest.mark.asyncio
+    async def test_unique_tickers_fetch_one_quote_each(self, tmp_path):
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        store.add_reminder(42, 10, "NVDA", 100.0, "above")
+        store.add_reminder(42, 10, "NVDA", 90.0, "below")
+        store.add_reminder(42, 10, "AAPL", 200.0, "above")
+
+        seen = []
+        factory = self.ticker_factory({"NVDA": extended_frame(), "AAPL": extended_frame()})
+
+        def recording_factory(ticker):
+            seen.append(ticker)
+            return factory(ticker)
+
+        with patch("bot.reminder_store", store), patch(
+            "bot.yf.Ticker", side_effect=recording_factory
+        ), patch.object(bot_module.bot, "get_channel", return_value=self.make_channel()):
+            await check_price_alerts()
+
+        # One quote per unique ticker: NVDA once, AAPL once.
+        assert sorted(seen) == ["AAPL", "NVDA"]
+
+    @pytest.mark.asyncio
+    async def test_failed_fetch_retains_only_its_own_reminders(self, tmp_path):
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        bad_id = store.add_reminder(42, 10, "NVDA", 100.0, "above")
+        good_id = store.add_reminder(42, 10, "AAPL", 140.0, "above")  # 148.5 >= 140
+
+        factory = self.ticker_factory({"AAPL": extended_frame()})  # NVDA unavailable
+
+        with patch("bot.reminder_store", store), patch(
+            "bot.yf.Ticker", side_effect=factory
+        ), patch.object(bot_module.bot, "get_channel", return_value=self.make_channel()):
+            await check_price_alerts()
+
+        rows = store.list_all()
+        assert [row["id"] for row in rows] == [bad_id]  # NVDA retained
+        assert store.get_by_id(good_id) is None  # AAPL notified
+
+    @pytest.mark.asyncio
+    async def test_failed_send_retains_reminder(self, tmp_path, capsys):
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        reminder_id = store.add_reminder(42, 10, "NVDA", 100.0, "above")
+        channel = self.make_channel(send=AsyncMock(side_effect=RuntimeError("no permission")))
+
+        with patch("bot.reminder_store", store), patch(
+            "bot.yf.Ticker", return_value=FakeTicker(extended_frame(), None, None)
+        ), patch.object(bot_module.bot, "get_channel", return_value=channel):
+            await check_price_alerts()
+
+        assert store.get_by_id(reminder_id) is not None
+        out = capsys.readouterr().out
+        assert f"alert #{reminder_id} (NVDA) send failed" in out
+        assert "no permission" not in out  # sanitized: exception type only
+
+    @pytest.mark.asyncio
+    async def test_get_channel_falls_back_to_fetch_channel(self, tmp_path):
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        reminder_id = store.add_reminder(42, 10, "NVDA", 100.0, "above")
+        channel = self.make_channel()
+
+        with patch("bot.reminder_store", store), patch(
+            "bot.yf.Ticker", return_value=FakeTicker(extended_frame(), None, None)
+        ), patch.object(bot_module.bot, "get_channel", return_value=None), patch.object(
+            bot_module.bot, "fetch_channel", new=AsyncMock(return_value=channel)
+        ) as fetch_mock:
+            await check_price_alerts()
+
+        fetch_mock.assert_awaited_once_with(10)
+        channel.send.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_unavailable_channel_retains_reminder(self, tmp_path):
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        store.add_reminder(42, 10, "NVDA", 100.0, "above")
+
+        with patch("bot.reminder_store", store), patch(
+            "bot.yf.Ticker", return_value=FakeTicker(extended_frame(), None, None)
+        ), patch.object(bot_module.bot, "get_channel", side_effect=RuntimeError("HTTP 404")), patch.object(
+            bot_module.bot, "fetch_channel", new=AsyncMock(side_effect=RuntimeError("HTTP 404"))
+        ):
+            await check_price_alerts()
+
+        assert store.list_all() != []
+
+    @pytest.mark.asyncio
+    async def test_dm_channel_never_receives_alerts(self, tmp_path):
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        store.add_reminder(42, 10, "NVDA", 100.0, "above")
+        channel = self.make_channel(guild_id=None)
+
+        with patch("bot.reminder_store", store), patch(
+            "bot.yf.Ticker", return_value=FakeTicker(extended_frame(), None, None)
+        ), patch.object(bot_module.bot, "get_channel", return_value=channel):
+            await check_price_alerts()
+
+        channel.send.assert_not_awaited()
+        assert store.list_all() != []
+
+    @pytest.mark.asyncio
+    async def test_persistence_across_restart_fires_once(self, tmp_path):
+        db_path = tmp_path / "reminders.db"
+        store_before = ReminderStore(db_path=db_path)
+        reminder_id = store_before.add_reminder(42, 10, "NVDA", 100.0, "above")
+
+        # Simulate a bot restart: a fresh store over the same database file.
+        store_after = ReminderStore(db_path=db_path)
+        channel = self.make_channel()
+
+        with patch("bot.reminder_store", store_after), patch(
+            "bot.yf.Ticker", return_value=FakeTicker(extended_frame(), None, None)
+        ), patch.object(bot_module.bot, "get_channel", return_value=channel):
+            await check_price_alerts()
+
+        channel.send.assert_awaited_once()
+        assert store_after.get_by_id(reminder_id) is None
+
+        store_verifier = ReminderStore(db_path=db_path)
+        assert store_verifier.list_all() == []
+
+
+@pytest.mark.asyncio
+class TestPriceAlertsLoopLifecycle:
+    """Loop lifecycle: started once, ready guard, clean stop."""
+
+    @pytest.fixture(autouse=True)
+    def reset_loop_state(self):
+        # Leftover lifecycle state from another test must not hide a second
+        # start (or a missing one).
+        bot_module.bot._price_alerts_started = False
+        yield
+        bot_module.bot._price_alerts_started = False
+
+    @pytest.mark.asyncio
+    async def test_setup_hook_starts_the_loop_only_once(self, monkeypatch):
+        monkeypatch.delenv("DISCORD_GUILD_ID", raising=False)
+        with patch("bot.sync_commands", new=AsyncMock(return_value=True)), patch(
+            "bot.price_alerts_loop.start"
+        ) as start_mock:
+            await bot_module.bot.setup_hook()
+            await bot_module.bot.setup_hook()  # simulated repeat/restart
+
+        start_mock.assert_called_once()
+        assert bot_module.bot._price_alerts_started is True
+
+    @pytest.mark.asyncio
+    async def test_loop_skips_cycle_when_not_ready(self):
+        with patch.object(bot_module.bot, "is_ready", return_value=False), patch(
+            "bot.check_price_alerts", new=AsyncMock()
+        ) as check_mock:
+            await price_alerts_loop()
+
+        check_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_loop_runs_cycle_when_ready(self):
+        with patch.object(bot_module.bot, "is_ready", return_value=True), patch(
+            "bot.check_price_alerts", new=AsyncMock()
+        ) as check_mock:
+            await price_alerts_loop()
+
+        check_mock.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_loop_failure_is_logged_and_does_not_raise(self, capsys):
+        with patch.object(bot_module.bot, "is_ready", return_value=True), patch(
+            "bot.check_price_alerts", new=AsyncMock(side_effect=RuntimeError("boom"))
+        ):
+            await price_alerts_loop()
+
+        out = capsys.readouterr().out
+        assert "price alert cycle failed: RuntimeError" in out
+
+    @pytest.mark.asyncio
+    async def test_on_close_cancels_the_loop(self):
+        with patch("bot.price_alerts_loop.cancel") as cancel_mock:
+            await on_close()
+
+        cancel_mock.assert_called_once()
 
 
 if __name__ == "__main__":

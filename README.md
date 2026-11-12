@@ -1,6 +1,6 @@
 # Discord Stock Price Bot
 
-A single-file Discord bot that responds to `/price <ticker>` with the latest available stock price from pre-market, regular and after-hours sessions, the daily change versus the previous trading close, and a dark 1-day 5-minute chart of that same extended-hours session.
+A single-file Discord bot that responds to `/price <ticker>` with the latest available stock price from pre-market, regular and after-hours sessions, the daily change versus the previous trading close, and a dark 1-day 5-minute chart of that same extended-hours session. It also supports one-shot stock price alerts: `/remind`, `/reminders` and `/unremind`, checked once every 60 seconds by a background task.
 
 See [CHANGELOG.md](CHANGELOG.md) for the extended-hours update and release history.
 
@@ -17,6 +17,9 @@ See [CHANGELOG.md](CHANGELOG.md) for the extended-hours update and release histo
 - **Observable command registration**: the startup log reports whether the slash command sync succeeded, which commands were registered, which servers got a copy, and what to check when it failed
 - **Automatic per-server registration**: every server the bot is in, and every server it joins later, gets its own `/price` registration as soon as the bot is ready — no guild ID or manual step needed
 - **Optional explicit guild**: `DISCORD_GUILD_ID` can still register one server before the gateway connects
+- **Price alerts**: `/remind <ticker> <target>` sets a one-shot alert, `/reminders` lists your pending alerts, `/unremind <id>` cancels one of yours. A background task checks pending alerts once every 60 seconds and notifies the owner in the original server channel exactly once
+- **Alert persistence**: pending alerts live in a local SQLite database (`reminders.db`, gitignored) beside `reminders.py`, so they survive bot restarts and deploys
+- **Safe alert failures**: a reminder is deleted only after its notification was sent successfully; any channel, quote or send failure keeps it for the next cycle
 
 ## Setup
 
@@ -182,6 +185,22 @@ The bot responds with an embed showing:
 - Exchange-local data timestamp from the quote bar, labeled as delayed / latest available
 - Dark 1-day 5-minute extended-hours chart as an attachment, covering pre-market, regular and after-hours and ending at the latest quote point (omitted when it cannot be derived)
 
+### Price alerts
+
+```
+/remind NVDA 150
+/reminders
+/unremind 12
+```
+
+- **`/remind <ticker> <target>`** (server channels only) fetches the latest price and stores a one-shot alert: direction **above** when the target is above the current price, **below** when it is below. A target equal to the current price at displayed precision is rejected, so an alert created on a stale closed-market quote can never fire on that same stale value. The confirmation is ephemeral and shows the alert ID, ticker, current price, target, direction and the quote timestamp with a delayed-data disclaimer.
+- **`/reminders`** lists only the invoking user's pending alerts (ID, ticker, target, direction) as an ephemeral message, chunked into multiple embeds beyond 25 alerts to stay inside Discord's limits.
+- **`/unremind <id>`** cancels one of the invoking user's alerts; other users' alerts are never visible or deletable.
+
+The alert checker runs once every **60 seconds**: it loads every pending reminder, fetches one lightweight quote per unique ticker (a single 5-day/1-minute extended-hours history fetch each — no `info`, daily history or chart requests), and fires an alert when the price is at or above the target (direction `above`) or at or below it (direction `below`). The owner is mentioned in the original channel with user-only allowed mentions (`<@user_id>`), the message carries the quote timestamp and a “delayed / latest available, not real-time” caveat, and the reminder is deleted only after the send succeeds. A failed channel lookup, quote fetch or send keeps the reminder for the next cycle, and DM channels never receive alerts. Alerts persist in `reminders.db` across restarts and deploys, and each alert is notified exactly once.
+
+### How Data Is Selected
+
 ## How Data Is Selected
 
 1. Fetch extended-hours history once with `period="5d"`, `interval="1m"`, `prepost=True` (pre-market, regular and after-hours).
@@ -198,7 +217,10 @@ The bot responds with an embed showing:
 - The chart is a 1-day/5-minute aggregation of that same extended-hours data, not a separate regular-hours endpoint. It covers pre-market, regular and after-hours, ends at the latest quote point, and uses green for rising segments, red for falling segments and gray for flat segments.
 - When the chart cannot be derived, the quote is sent without a chart rather than failing the command.
 - Quotes and charts are delayed and not guaranteed to be real-time; the embed footer labels them that way.
-- No database, caching, or background jobs — one bot file and one slash command.
+- Alerts use the lightweight `fetch_latest_price` helper: one 5-day/1-minute extended-hours fetch per ticker per check, no `info`/daily-history/chart requests, always run in an executor thread so the event loop is never blocked.
+- Alert polling is a single 60-second background loop started once at startup (with a ready guard, so reconnects never create a second loop) and cancelled cleanly when the bot closes.
+- When the market is closed the same stale quote persists, and because alert directions are always set away from the current price at creation, a stale quote can never trigger its own alert automatically.
+- Pending alerts are stored in `reminders.db` (gitignored) beside `reminders.py`; on the server the file lives in the persistent `/home/server/stkbot` checkout, so alerts survive deploys and restarts. If a notification is sent but the database delete fails, the alert may be re-sent on the next cycle — the only known duplicate path.
 - Never commit your actual `.env` file with the token.
 
 ## Testing
@@ -210,7 +232,7 @@ pip install -r requirements.txt
 python -m pytest test_bot.py -v
 ```
 
-The suite exercises the real `/price` callback, including defer behavior, one extended-hours fetch plus one daily lookback and no separate chart fetch, quote/chart consistency (the chart ends at the extended-hours quote timestamp and value), pre-market/regular/after-hours chart coverage, 5-minute bin aggregation, weekend quotes charting their own session (with a Friday-only fallback when no weekend bars exist), chartless quotes when aggregation is unavailable, no stale chart fallback when 1-minute data is missing, closed-session and pre-market previous closes, invalid tickers, empty/error data, and chart buffer cleanup on send failure. Chart tests inspect rendered pixels for a dark background and per-segment green/red/gray colours, including a net-positive day with falling segments. Command registration is covered with a mocked command tree: global sync, explicit guild sync (copy-before-sync, exactly one guild-scoped sync, no global clear or global sync), invalid `DISCORD_GUILD_ID` handling, and that startup sync runs once rather than on every reconnect. A real `CommandTree` test verifies that the global command registration survives explicit guild mode while the guild copy exists. Automatic registration is covered with mocked ready/join/leave events: every cached server is registered on ready, reconnects do not repeat REST syncs, joined servers register once, a failing server does not block the others and is retried, and global commands are never cleared.
+The suite exercises the real `/price` callback, including defer behavior, one extended-hours fetch plus one daily lookback and no separate chart fetch, quote/chart consistency (the chart ends at the extended-hours quote timestamp and value), pre-market/regular/after-hours chart coverage, 5-minute bin aggregation, weekend quotes charting their own session (with a Friday-only fallback when no weekend bars exist), chartless quotes when aggregation is unavailable, no stale chart fallback when 1-minute data is missing, closed-session and pre-market previous closes, invalid tickers, empty/error data, and chart buffer cleanup on send failure. Chart tests inspect rendered pixels for a dark background and per-segment green/red/gray colours, including a net-positive day with falling segments. Command registration is covered with a mocked command tree: global sync, explicit guild sync (copy-before-sync, exactly one guild-scoped sync, no global clear or global sync), invalid `DISCORD_GUILD_ID` handling, and that startup sync runs once rather than on every reconnect. A real `CommandTree` test verifies that the global command registration survives explicit guild mode while the guild copy exists. Automatic registration is covered with mocked ready/join/leave events: every cached server is registered on ready, reconnects do not repeat REST syncs, joined servers register once, a failing server does not block the others and is retried, and global commands are never cleared. Price alerts are covered with real mocked slash callbacks and checker cycles against `tmp_path` databases: the lightweight quote helper makes exactly one 5d/1m fetch, `/remind` validation (invalid ticker, non-positive target, DM channel, equal current price, executor threading) and persistence, `/reminders` owner-only listing with embed chunking, `/unremind` owner-only cancellation, and the 60-second cycle (unique-ticker quote fetches, upward/downward/equal triggers, one-time notification, failed fetch/send retention, DM and unavailable-channel retention, `get_channel`→`fetch_channel` fallback, persistence across a simulated restart, loop started exactly once, ready guard and clean stop on close). `test_reminders.py` covers the SQLite storage layer (schema, validation, user isolation, owner-checked and ID-only deletes).
 
 ## Deployment
 

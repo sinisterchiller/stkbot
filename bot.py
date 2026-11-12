@@ -1,4 +1,9 @@
-"""Discord stock price bot with /price slash command."""
+"""Discord stock price bot with /price and one-shot price alerts.
+
+Slash commands: /price, /remind, /reminders, /unremind. A background task
+checks pending alerts once every 60 seconds and notifies their owners in the
+original guild channel; alerts persist in a local SQLite database.
+"""
 
 import asyncio
 import math
@@ -18,9 +23,11 @@ import pandas as pd
 import yfinance as yf
 from matplotlib.collections import LineCollection
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from reminders import ReminderStore
 
 load_dotenv()
 
@@ -61,6 +68,14 @@ SYNC_TROUBLESHOOTING = (
 # left unsynced for the next ready pass (reconnect or restart) to retry.
 GUILD_SYNC_ATTEMPTS = 3
 GUILD_SYNC_RETRY_DELAY = 5.0
+
+# Seconds between price-alert checks. discord.py does not auto-start ext.tasks
+# loops, so this loop is started exactly once in StockPriceBot.setup_hook.
+ALERT_CHECK_SECONDS = 60
+
+# Discord caps an embed at 25 fields; one field per reminder keeps /reminders
+# readable and chunked safely.
+REMINDER_FIELDS_PER_EMBED = 25
 
 
 def parse_guild_id(raw: Optional[str]) -> Optional[int]:
@@ -207,11 +222,17 @@ class StockPriceBot(commands.Bot):
         self._synced_guild_ids: set[int] = set()
         self._syncing_guild_ids: set[int] = set()
         self._guild_sync_lock = asyncio.Lock()
+        self._price_alerts_started = False
 
     async def setup_hook(self) -> None:
         guild_id = get_guild_id()
         if await sync_commands(self.tree) and guild_id is not None:
             self._synced_guild_ids.add(guild_id)
+        # setup_hook runs once per process (reconnects only fire on_ready),
+        # so this guard keeps the alert loop from ever being started twice.
+        if not self._price_alerts_started:
+            self._price_alerts_started = True
+            price_alerts_loop.start()
 
     async def sync_guild(self, guild) -> bool:
         """
@@ -539,6 +560,47 @@ def fetch_quote(ticker: str) -> Optional[StockQuote]:
     )
 
 
+@dataclass(frozen=True)
+class LatestPrice:
+    """Lightweight quote result: the last valid bar and its timestamp."""
+
+    price: float
+    timestamp: object
+
+
+def fetch_latest_price(ticker: str) -> Optional[LatestPrice]:
+    """
+    Lightweight latest-price lookup for /remind and the alert checker.
+
+    Exactly one 5-day/1-minute extended-hours history fetch is made (no
+    ``info``, no daily history, no chart request). The quote is the last
+    chronologically valid finite positive close selected by the existing
+    sanitizer, paired with that bar's own timestamp. Returns None on a
+    Yahoo Finance error, empty data, or no usable bar. Synchronous and
+    blocking: callers must run it via ``asyncio.to_thread``.
+    """
+    try:
+        client = yf.Ticker(ticker)
+        extended_hist = client.history(
+            period=EXTENDED_PERIOD,
+            interval=EXTENDED_INTERVAL,
+            prepost=True,
+            auto_adjust=False,
+        )
+    except Exception:
+        return None
+
+    extended = _sanitize_intraday(extended_hist)
+    if extended is None:
+        return None
+
+    price = _positive_finite(extended["Close"].iloc[-1])
+    if price is None:
+        return None
+
+    return LatestPrice(price=price, timestamp=extended.index[-1])
+
+
 def _chart_time_label(ts) -> str:
     """Format a chart timestamp in its own exchange-local timezone."""
     if getattr(ts, "tzinfo", None) is not None:
@@ -725,6 +787,13 @@ async def on_guild_remove(guild):
     bot.forget_guild(guild.id)
 
 
+@bot.event
+async def on_close():
+    # discord.py does not cancel ext.tasks loops on close, so stop the alert
+    # checker cleanly when the bot shuts down.
+    price_alerts_loop.cancel()
+
+
 @bot.tree.command(
     name="price",
     description="Latest stock price (extended hours) with 1D 5-min extended-hours chart",
@@ -781,6 +850,278 @@ async def price(interaction: discord.Interaction, ticker: str):
             chart_file.close()
         if chart_buffer is not None:
             chart_buffer.close()
+
+
+# ---------------------------------------------------------------------------
+# Price alerts: /remind, /reminders, /unremind and the 60-second checker.
+
+reminder_store = ReminderStore()
+
+
+def _build_remind_embed(
+    reminder_id: int,
+    ticker: str,
+    direction: str,
+    target_price: float,
+    quote: LatestPrice,
+) -> discord.Embed:
+    """Ephemeral confirmation embed for a newly created price alert."""
+    direction_text = "rising above" if direction == "above" else "falling below"
+    embed = discord.Embed(
+        title=f"Price alert #{reminder_id} set",
+        description=(
+            f"**{ticker}** {direction_text} **${target_price:.2f}**\n"
+            f"Current: ${quote.price:.2f}\n"
+            f"Quote as of {_format_timestamp(quote.timestamp, None)} — "
+            "delayed / latest available, not real-time"
+        ),
+        color=discord.Color.green() if direction == "above" else discord.Color.red(),
+    )
+    embed.add_field(name="ID", value=str(reminder_id), inline=True)
+    embed.add_field(name="Ticker", value=ticker, inline=True)
+    embed.add_field(name="Target", value=f"${target_price:.2f}", inline=True)
+    embed.add_field(name="Current", value=f"${quote.price:.2f}", inline=True)
+    embed.add_field(name="Direction", value=direction, inline=True)
+    return embed
+
+
+def _build_reminder_embeds(rows: list[dict]) -> list[discord.Embed]:
+    """One embed per chunk of at most REMINDER_FIELDS_PER_EMBED reminders.
+
+    Chunking keeps /reminders inside Discord's 25-field-per-embed limit.
+    """
+    embeds: list[discord.Embed] = []
+    for start in range(0, len(rows), REMINDER_FIELDS_PER_EMBED):
+        embed = discord.Embed(
+            title="Your pending price alerts",
+            color=discord.Color.blue(),
+        )
+        for row in rows[start : start + REMINDER_FIELDS_PER_EMBED]:
+            embed.add_field(
+                name=f"#{row['id']} {row['ticker']}",
+                value=f"${row['target_price']:.2f} ({row['direction']})",
+                inline=True,
+            )
+        embeds.append(embed)
+    return embeds
+
+
+def _alert_message(row: dict, quote: LatestPrice) -> str:
+    """Alert text mentioning the owner; user mentions only, delayed caveat."""
+    direction_text = "rose above" if row["direction"] == "above" else "fell below"
+    return (
+        f"<@{row['user_id']}> 🔔 **{row['ticker']}** {direction_text} its target: "
+        f"latest ${quote.price:.2f} vs target ${row['target_price']:.2f}.\n"
+        f"Quote as of {_format_timestamp(quote.timestamp, None)} — "
+        "delayed / latest available, not real-time."
+    )
+
+
+async def _resolve_alert_channel(channel_id: int):
+    """Cached channel lookup first, then a REST fetch; None on any failure."""
+    try:
+        channel = bot.get_channel(channel_id)
+        if channel is None:
+            channel = await bot.fetch_channel(channel_id)
+    except Exception:
+        return None
+    return channel
+
+
+async def check_price_alerts() -> None:
+    """
+    Run one 60-second alert cycle.
+
+    Loads every pending reminder, fetches one lightweight quote per unique
+    ticker, and for each due reminder (price >= target for 'above',
+    <= target for 'below') sends a user-mentioning message to the original
+    guild channel. The reminder is deleted only after a successful send;
+    any channel lookup, quote fetch, or send failure retains it for the
+    next cycle. DM channels never receive alerts.
+    """
+    pending = await asyncio.to_thread(reminder_store.list_all)
+    if not pending:
+        return
+
+    unique_tickers = {row["ticker"] for row in pending}
+    quotes: dict[str, Optional[LatestPrice]] = {}
+    for ticker in sorted(unique_tickers):
+        try:
+            quotes[ticker] = await asyncio.to_thread(fetch_latest_price, ticker)
+        except Exception as exc:
+            print(f"WARNING: quote fetch failed for {ticker}: {type(exc).__name__}")
+            quotes[ticker] = None
+
+    for row in pending:
+        quote = quotes.get(row["ticker"])
+        if quote is None:
+            # Yahoo unavailable for this ticker; keep the alert for next cycle.
+            continue
+
+        target = row["target_price"]
+        if row["direction"] == "above":
+            due = quote.price >= target
+        else:
+            due = quote.price <= target
+        if not due:
+            # Stale closed-market quotes persist, and a direction set away
+            # from the current price never fires on that stale value.
+            continue
+
+        channel = await _resolve_alert_channel(row["channel_id"])
+        if channel is None or getattr(channel, "guild", None) is None:
+            print(
+                f"WARNING: alert #{row['id']} ({row['ticker']}) retained: "
+                "channel unavailable or not a guild channel."
+            )
+            continue
+
+        try:
+            await channel.send(
+                _alert_message(row, quote),
+                allowed_mentions=discord.AllowedMentions(users=True),
+            )
+        except Exception as exc:
+            print(
+                f"WARNING: alert #{row['id']} ({row['ticker']}) send failed: "
+                f"{type(exc).__name__}"
+            )
+            continue
+
+        deleted = await asyncio.to_thread(reminder_store.delete_by_id_only, row["id"])
+        if not deleted:
+            print(
+                f"WARNING: alert #{row['id']} sent but delete failed; it may be "
+                "re-sent on the next cycle."
+            )
+
+
+@tasks.loop(seconds=ALERT_CHECK_SECONDS)
+async def price_alerts_loop():
+    """
+    60-second alert cycle with a ready guard.
+
+    Started once in setup_hook; skipped while the bot is not ready, so a
+    reconnect can never spawn a second loop. One cycle at a time (the loop
+    waits for each cycle to finish), so reminders are never notified twice.
+    """
+    if not bot.is_ready():
+        return
+    try:
+        await check_price_alerts()
+    except Exception as exc:
+        print(f"WARNING: price alert cycle failed: {type(exc).__name__}")
+
+
+@bot.tree.command(
+    name="remind",
+    description="Set a one-shot price alert for a ticker",
+)
+@app_commands.describe(ticker="Stock ticker symbol (e.g., NVDA)")
+@app_commands.describe(target="Target price to alert on")
+async def remind(interaction: discord.Interaction, ticker: str, target: float):
+    """Slash command to set a one-shot price alert.
+
+    The direction is derived from the fetched price (target above current
+    means 'above', below means 'below'), and a target equal to the current
+    price at displayed precision is rejected, so an alert created on a
+    stale closed-market quote cannot fire on that same stale value.
+    """
+    await interaction.response.defer(thinking=True)
+
+    normalized = ticker.strip().upper()
+    channel = interaction.channel
+    guild = getattr(channel, "guild", None)
+    if guild is None:
+        await interaction.followup.send(
+            "Price alerts only work in server channels, not DMs.",
+            ephemeral=True,
+        )
+        return
+
+    if not TICKER_PATTERN.fullmatch(normalized):
+        await interaction.followup.send(
+            f"❌ **{discord.utils.escape_markdown(normalized) or 'Input'}** is not a valid ticker symbol. "
+            "Try something like `NVDA`, `BRK-B`, or `^GSPC`.",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        target_price = float(target)
+    except (TypeError, ValueError):
+        target_price = None
+    if target_price is None or not math.isfinite(target_price) or target_price <= 0:
+        await interaction.followup.send(
+            "❌ The target price must be a positive number (e.g., `150`).",
+            ephemeral=True,
+        )
+        return
+
+    quote = await asyncio.to_thread(fetch_latest_price, normalized)
+    if quote is None:
+        await interaction.followup.send(
+            f"❌ Could not fetch a latest price for **{normalized}**. Invalid symbol, "
+            "no market data, or a temporary Yahoo Finance error. Try again shortly.",
+            ephemeral=True,
+        )
+        return
+
+    if round(quote.price, 2) == round(target_price, 2):
+        await interaction.followup.send(
+            f"❌ **{normalized}** is already trading at ${target_price:.2f}. "
+            "Choose a target away from the current price.",
+            ephemeral=True,
+        )
+        return
+
+    direction = "above" if target_price > quote.price else "below"
+    reminder_id = await asyncio.to_thread(
+        reminder_store.add_reminder,
+        interaction.user.id,
+        channel.id,
+        normalized,
+        target_price,
+        direction,
+    )
+    await interaction.followup.send(
+        embed=_build_remind_embed(reminder_id, normalized, direction, target_price, quote),
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="reminders", description="List your pending price alerts")
+async def reminders(interaction: discord.Interaction):
+    """Slash command to list the invoking user's pending alerts (ephemeral)."""
+    await interaction.response.defer(thinking=True)
+
+    rows = await asyncio.to_thread(reminder_store.list_by_user, interaction.user.id)
+    if not rows:
+        await interaction.followup.send(
+            "You have no pending price alerts. Use /remind to create one.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.followup.send(
+        embeds=_build_reminder_embeds(rows), ephemeral=True
+    )
+
+
+@bot.tree.command(name="unremind", description="Cancel one of your price alerts by ID")
+@app_commands.describe(id="Alert ID shown by /reminders")
+async def unremind(interaction: discord.Interaction, id: int):
+    """Slash command to cancel one of the invoking user's alerts (owner only)."""
+    await interaction.response.defer(thinking=True)
+
+    deleted = await asyncio.to_thread(reminder_store.delete_by_id, id, interaction.user.id)
+    if deleted:
+        await interaction.followup.send(f"✅ Alert #{id} cancelled.", ephemeral=True)
+    else:
+        await interaction.followup.send(
+            f"❌ No pending alert with ID {id} belongs to you. Check /reminders.",
+            ephemeral=True,
+        )
 
 
 def main():
