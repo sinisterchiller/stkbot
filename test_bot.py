@@ -29,22 +29,18 @@ class FakeTicker:
     def __init__(
         self,
         extended=None,
-        intraday=None,
         daily=None,
         info=None,
         *,
         info_error=None,
         extended_error=None,
-        intraday_error=None,
         daily_error=None,
     ):
         self.extended = extended
-        self.intraday = intraday
         self.daily = daily
         self.info_data = info if info is not None else {}
         self.info_error = info_error
         self.extended_error = extended_error
-        self.intraday_error = intraday_error
         self.daily_error = daily_error
         self.history_calls = []
         self.history_thread_ids = []
@@ -64,33 +60,30 @@ class FakeTicker:
             if self.extended is None:
                 return pd.DataFrame()
             return self.extended
-        if period == "1d" and interval == "5m":
-            if self.intraday_error is not None:
-                raise self.intraday_error
-            if self.intraday is None:
-                return pd.DataFrame()
-            return self.intraday
         if period == "10d" and interval == "1d":
             if self.daily_error is not None:
                 raise self.daily_error
             if self.daily is None:
                 return pd.DataFrame()
             return self.daily
-        raise AssertionError(f"Unexpected history call: {period=} {interval=}")
+        raise AssertionError(
+            "The chart must be derived from the extended-hours fetch; "
+            f"unexpected history call: {period=} {interval=}"
+        )
 
 
-def intraday_frame(
-    start="2024-01-12 14:30",
-    periods=18,
+def chart_frame(
+    start="2024-01-12 09:30",
+    periods=5,
     closes=None,
     tz="America/New_York",
 ):
-    """Regular-hours 1-day/5-minute chart frame (last bar 15:55)."""
+    """A ready-made 5-minute session frame for generate_chart tests."""
     if closes is not None:
         periods = len(closes)
     dates = pd.date_range(start=start, periods=periods, freq="5min", tz=tz)
     if closes is None:
-        closes = np.linspace(145.0, 147.0, periods)
+        closes = [100.0, 101.0, 101.0, 99.0, 102.0]
     return pd.DataFrame({"Close": closes}, index=dates)
 
 
@@ -107,6 +100,12 @@ def extended_frame(
     if closes is None:
         closes = np.linspace(145.0, 148.5, periods)
     return pd.DataFrame({"Close": closes}, index=dates)
+
+
+def full_session_frame(tz="America/New_York"):
+    """One-minute bars from 04:00 pre-market through 19:59 after-hours."""
+    dates = pd.date_range("2024-01-12 04:00", "2024-01-12 19:59", freq="1min", tz=tz)
+    return pd.DataFrame({"Close": np.linspace(100.0, 110.0, len(dates))}, index=dates)
 
 
 def daily_frame(rows, tz="America/New_York"):
@@ -150,7 +149,6 @@ class TestFetchQuote:
 
     def test_valid_ticker_returns_quote_from_one_minute_extended_data(self):
         ext = extended_frame()
-        hist = intraday_frame()
         daily = daily_frame(
             [
                 ("2024-01-08", 140.0),
@@ -162,7 +160,6 @@ class TestFetchQuote:
         )
         fake = FakeTicker(
             ext,
-            hist,
             daily,
             {"longName": "NVIDIA Corporation", "exchangeTimezoneName": "America/New_York"},
         )
@@ -173,15 +170,18 @@ class TestFetchQuote:
         assert quote is not None
         assert quote.ticker == "NVDA"
         assert quote.company_name == "NVIDIA Corporation"
-        # Quote comes from the 1-minute extended fetch, chart from 5m regular.
         assert quote.latest_price == pytest.approx(148.5)
         assert quote.previous_close == 145.0
         assert quote.change == pytest.approx(3.5)
         assert quote.change_pct == pytest.approx(3.5 / 145.0 * 100)
-        assert quote.intraday.equals(hist[["Close"]])
+        # The chart is aggregated from the same extended-hours fetch and ends
+        # at the raw quote point, not at a 5-minute bucket left edge.
+        assert quote.intraday is not None
+        assert quote.intraday.index[-1] == ext.index[-1]
+        assert quote.intraday["Close"].iloc[-1] == pytest.approx(148.5)
         assert ("5d", "1m", True, False) in fake.history_calls
-        assert ("1d", "5m", False, False) in fake.history_calls
-        # Timestamp is the last extended bar (16:05), not the chart's 15:55.
+        assert not [call for call in fake.history_calls if call[0] == "1d"]
+        # Timestamp is the last extended bar (16:05).
         assert "16:05" in quote.timestamp_label
         assert "EST" in quote.timestamp_label
         assert "UTC" not in quote.timestamp_label
@@ -197,7 +197,7 @@ class TestFetchQuote:
                 ("2024-01-12", 999.0),  # same session must not be previous close
             ]
         )
-        fake = FakeTicker(ext, intraday_frame(), daily, {"longName": "Test Corp"})
+        fake = FakeTicker(ext, daily, {"longName": "Test Corp"})
 
         with patch("bot.yf.Ticker", return_value=fake):
             quote = fetch_quote("TEST")
@@ -210,7 +210,6 @@ class TestFetchQuote:
     def test_daily_lookback_uses_ten_days(self):
         fake = FakeTicker(
             extended_frame(),
-            intraday_frame(),
             daily_frame([("2024-01-11", 145.0)]),
             {"longName": "Test Corp"},
         )
@@ -225,7 +224,6 @@ class TestFetchQuote:
         # Monday's after-hours session, with Friday as the latest prior daily
         # row and stale weekend rows that must be ignored.
         ext = extended_frame(start="2024-01-16 15:57", periods=4, closes=[101, 102, 103, 104])
-        hist = intraday_frame(start="2024-01-16 09:30", periods=4, closes=[101, 102, 103, 104])
         daily = daily_frame(
             [
                 ("2024-01-11", 99.0),
@@ -236,7 +234,7 @@ class TestFetchQuote:
                 ("2024-01-16", 104.0),
             ]
         )
-        fake = FakeTicker(ext, hist, daily, {"longName": "Test Corp"})
+        fake = FakeTicker(ext, daily, {"longName": "Test Corp"})
 
         with patch("bot.yf.Ticker", return_value=fake):
             quote = fetch_quote("TEST")
@@ -248,14 +246,13 @@ class TestFetchQuote:
     def test_premarket_quote_on_new_day_uses_previous_regular_day_close(self):
         # Monday 04:00 pre-market bar; the previous trading close is Friday's.
         ext = extended_frame(start="2024-01-16 04:00", periods=3, closes=[100.5, 100.8, 101.0])
-        hist = intraday_frame(start="2024-01-16 09:30", periods=4, closes=[101, 102, 103, 104])
         daily = daily_frame(
             [
                 ("2024-01-15", 100.0),
                 ("2024-01-16", 999.0),
             ]
         )
-        fake = FakeTicker(ext, hist, daily, {"longName": "Test Corp"})
+        fake = FakeTicker(ext, daily, {"longName": "Test Corp"})
 
         with patch("bot.yf.Ticker", return_value=fake):
             quote = fetch_quote("TEST")
@@ -274,7 +271,7 @@ class TestFetchQuote:
                 ("2024-01-12", 147.0),
             ]
         )
-        fake = FakeTicker(ext, intraday_frame(), daily, {"longName": "Test Corp"})
+        fake = FakeTicker(ext, daily, {"longName": "Test Corp"})
 
         with patch("bot.yf.Ticker", return_value=fake):
             quote = fetch_quote("TEST")
@@ -288,7 +285,6 @@ class TestFetchQuote:
         daily = daily_frame([("2024-01-11", 145.0)])
         fake = FakeTicker(
             ext,
-            intraday_frame(),
             daily_frame([("2024-01-11", 145.0)]),
             info_error=RuntimeError("info unavailable"),
         )
@@ -304,7 +300,6 @@ class TestFetchQuote:
     def test_daily_missing_falls_back_to_info_previous_close(self):
         fake = FakeTicker(
             extended_frame(closes=[145, 146, 147, 148]),
-            intraday_frame(),
             pd.DataFrame(),
             {"longName": "Test Corp", "previousClose": 142.0},
         )
@@ -318,7 +313,6 @@ class TestFetchQuote:
     def test_daily_exception_falls_back_to_info_previous_close(self):
         fake = FakeTicker(
             extended_frame(closes=[145, 146, 147, 148]),
-            intraday_frame(),
             daily_error=RuntimeError("daily history unavailable"),
             info={"longName": "Test Corp", "previousClose": 142.0},
         )
@@ -334,7 +328,6 @@ class TestFetchQuote:
         daily = daily_frame([("2024-01-11", 145.0)])
         fake = FakeTicker(
             naive_ext,
-            intraday_frame(),
             daily,
             {"longName": "Test Corp", "exchangeTimezoneName": "America/New_York"},
         )
@@ -349,7 +342,7 @@ class TestFetchQuote:
     def test_naive_timestamp_without_timezone_does_not_claim_utc(self):
         naive_ext = extended_frame(tz=None)
         daily = daily_frame([("2024-01-11", 145.0)], tz=None)
-        fake = FakeTicker(naive_ext, intraday_frame(), daily, {"longName": "Test Corp"})
+        fake = FakeTicker(naive_ext, daily, {"longName": "Test Corp"})
 
         with patch("bot.yf.Ticker", return_value=fake):
             quote = fetch_quote("TEST")
@@ -368,7 +361,6 @@ class TestFetchQuote:
         daily = daily_frame([("2024-01-11", 145.0)])
         fake = FakeTicker(
             ext,
-            intraday_frame(),
             daily,
             {"longName": "Test Corp", "exchangeTimezoneName": "America/New_York"},
         )
@@ -378,6 +370,10 @@ class TestFetchQuote:
 
         assert quote is not None
         assert quote.timestamp_label == "2024-01-12 15:51:00 EST"
+        # Bins are exchange-local even though the source index is UTC.
+        assert quote.intraday is not None
+        assert str(quote.intraday.index.tz) == "America/New_York"
+        assert quote.intraday.index[-1].strftime("%H:%M") == "15:51"
 
     @pytest.mark.parametrize(
         "ext",
@@ -394,7 +390,7 @@ class TestFetchQuote:
         ],
     )
     def test_invalid_extended_data_returns_none(self, ext):
-        fake = FakeTicker(ext, intraday_frame(), daily_frame([("2024-01-11", 100.0)]), {"previousClose": 100.0})
+        fake = FakeTicker(ext, daily_frame([("2024-01-11", 100.0)]), {"previousClose": 100.0})
 
         with patch("bot.yf.Ticker", return_value=fake):
             assert fetch_quote("BAD") is None
@@ -406,7 +402,7 @@ class TestFetchQuote:
             {"Close": [147.0, 148.0, trailing]},
             index=pd.date_range("2024-01-12 15:57", periods=3, freq="1min", tz="America/New_York"),
         )
-        fake = FakeTicker(ext, intraday_frame(), daily_frame([("2024-01-11", 145.0)]), {"longName": "Test Corp"})
+        fake = FakeTicker(ext, daily_frame([("2024-01-11", 145.0)]), {"longName": "Test Corp"})
 
         with patch("bot.yf.Ticker", return_value=fake):
             quote = fetch_quote("TEST")
@@ -416,6 +412,8 @@ class TestFetchQuote:
         # Timestamp comes from the same valid bar as the price.
         assert "15:58" in quote.timestamp_label
         assert quote.intraday is not None
+        assert quote.intraday.index[-1].strftime("%H:%M") == "15:58"
+        assert quote.intraday["Close"].iloc[-1] == pytest.approx(148.0)
 
     @pytest.mark.parametrize(
         "closes, expected",
@@ -432,7 +430,7 @@ class TestFetchQuote:
             {"Close": closes},
             index=pd.date_range("2024-01-12 15:57", periods=len(closes), freq="1min", tz="America/New_York"),
         )
-        fake = FakeTicker(ext, intraday_frame(), daily_frame([("2024-01-11", 145.0)]), {"longName": "Test Corp"})
+        fake = FakeTicker(ext, daily_frame([("2024-01-11", 145.0)]), {"longName": "Test Corp"})
 
         with patch("bot.yf.Ticker", return_value=fake):
             quote = fetch_quote("TEST")
@@ -441,12 +439,94 @@ class TestFetchQuote:
         # The quote is the last chronologically valid positive close.
         assert quote.latest_price == pytest.approx(expected)
 
-    def test_missing_1m_data_even_with_5m_returns_none(self):
-        # No stale 5-minute fallback: without 1-minute extended data there is
-        # no quote, even when a regular-hours chart frame exists.
+    def test_chart_covers_premarket_regular_and_after_hours(self):
+        ext = full_session_frame()
+        daily = daily_frame([("2024-01-11", 100.0)])
+        fake = FakeTicker(ext, daily, {"longName": "Test Corp"})
+
+        with patch("bot.yf.Ticker", return_value=fake):
+            quote = fetch_quote("TEST")
+
+        assert quote is not None
+        chart = quote.intraday
+        assert chart is not None
+        hours = {timestamp.hour for timestamp in chart.index}
+        assert 4 in hours  # pre-market
+        assert 9 in hours and 12 in hours  # regular session
+        assert 17 in hours and 18 in hours  # after-hours
+        # The last point is the raw quote timestamp, not a 5-minute left edge.
+        assert chart.index[-1] == ext.index[-1]
+        assert chart["Close"].iloc[-1] == pytest.approx(110.0)
+
+    def test_chart_takes_last_minute_close_per_five_minute_bin(self):
+        ext = pd.DataFrame(
+            {"Close": [100.0, 101.0, 102.0, 103.0, 104.0, 105.0]},
+            index=pd.date_range(
+                "2024-01-12 09:30", periods=6, freq="1min", tz="America/New_York"
+            ),
+        )
+        daily = daily_frame([("2024-01-11", 100.0)])
+        fake = FakeTicker(ext, daily, {"longName": "Test Corp"})
+
+        with patch("bot.yf.Ticker", return_value=fake):
+            quote = fetch_quote("TEST")
+
+        assert quote is not None
+        chart = quote.intraday
+        assert chart is not None
+        # 09:30-09:34 closes into the 09:30 bin; 09:35 starts the next bin and
+        # is also the raw quote point because its bucket left edge is 09:35.
+        assert chart.index[0].strftime("%H:%M") == "09:30"
+        assert chart["Close"].iloc[0] == pytest.approx(104.0)
+        assert chart.index[-1].strftime("%H:%M") == "09:35"
+        assert chart["Close"].iloc[-1] == pytest.approx(105.0)
+
+    def test_weekend_quote_charts_last_weekday_session(self):
+        # Stale weekend rows must not replace the last real trading session.
+        friday = extended_frame(
+            start="2024-01-12 15:57", periods=4, closes=[101, 102, 103, 104]
+        )
+        saturday = pd.DataFrame(
+            {"Close": [105.0, 106.0]},
+            index=pd.date_range(
+                "2024-01-13 10:00", periods=2, freq="1min", tz="America/New_York"
+            ),
+        )
+        ext = pd.concat([friday, saturday])
+        daily = daily_frame([("2024-01-12", 100.0)])
+        fake = FakeTicker(ext, daily, {"longName": "Test Corp"})
+
+        with patch("bot.yf.Ticker", return_value=fake):
+            quote = fetch_quote("TEST")
+
+        assert quote is not None
+        assert quote.latest_price == pytest.approx(106.0)
+        assert quote.intraday is not None
+        chart = quote.intraday
+        assert {timestamp.date() for timestamp in chart.index} == {
+            pd.Timestamp("2024-01-12").date()
+        }
+        assert chart["Close"].iloc[-1] == pytest.approx(104.0)
+
+    def test_chart_aggregation_failure_keeps_quote_without_chart(self):
+        fake = FakeTicker(
+            extended_frame(),
+            daily_frame([("2024-01-11", 145.0)]),
+            {"longName": "Test Corp"},
+        )
+
+        with patch("bot.yf.Ticker", return_value=fake), patch(
+            "bot._session_chart_frame", side_effect=RuntimeError("aggregation failed")
+        ):
+            quote = fetch_quote("TEST")
+
+        assert quote is not None
+        assert quote.intraday is None
+        assert quote.latest_price == pytest.approx(148.5)
+
+    def test_missing_1m_data_returns_none_without_chart_fallback(self):
         fake = FakeTicker(
             pd.DataFrame(),
-            intraday_frame(),
             daily_frame([("2024-01-11", 145.0)]),
             {"longName": "Test Corp", "previousClose": 145.0},
         )
@@ -457,45 +537,12 @@ class TestFetchQuote:
     def test_extended_history_exception_returns_none(self):
         fake = FakeTicker(
             None,
-            intraday_frame(),
             daily_frame([("2024-01-11", 145.0)]),
             extended_error=RuntimeError("Yahoo unavailable"),
         )
 
         with patch("bot.yf.Ticker", return_value=fake):
             assert fetch_quote("ERROR") is None
-
-    def test_regular_chart_fetch_failure_keeps_quote_without_chart(self):
-        # A chart-fetch failure must not invalidate an already valid quote.
-        fake = FakeTicker(
-            extended_frame(),
-            None,
-            daily_frame([("2024-01-11", 145.0)]),
-            {"longName": "Test Corp"},
-            intraday_error=RuntimeError("network down"),
-        )
-
-        with patch("bot.yf.Ticker", return_value=fake):
-            quote = fetch_quote("TEST")
-
-        assert quote is not None
-        assert quote.intraday is None
-        assert quote.latest_price == pytest.approx(148.5)
-
-    def test_empty_regular_chart_keeps_quote_without_chart(self):
-        fake = FakeTicker(
-            extended_frame(),
-            pd.DataFrame(),
-            daily_frame([("2024-01-11", 145.0)]),
-            {"longName": "Test Corp"},
-        )
-
-        with patch("bot.yf.Ticker", return_value=fake):
-            quote = fetch_quote("TEST")
-
-        assert quote is not None
-        assert quote.intraday is None
-        assert quote.latest_price == pytest.approx(148.5)
 
     def test_ticker_constructor_exception_returns_none(self):
         with patch("bot.yf.Ticker", side_effect=RuntimeError("network down")):
@@ -505,7 +552,6 @@ class TestFetchQuote:
     def test_invalid_previous_close_returns_none(self, previous_close):
         fake = FakeTicker(
             extended_frame(),
-            intraday_frame(),
             pd.DataFrame(),
             {"longName": "Test Corp", "previousClose": previous_close},
         )
@@ -518,9 +564,8 @@ class TestPriceCommand:
     """Exercise the real slash-command callback with a mocked interaction."""
 
     @pytest.mark.asyncio
-    async def test_success_sends_extended_quote_and_regular_hours_chart(self):
+    async def test_success_sends_extended_quote_and_extended_hours_chart(self):
         ext = extended_frame()
-        hist = intraday_frame()
         daily = daily_frame(
             [
                 ("2024-01-08", 140.0),
@@ -532,7 +577,6 @@ class TestPriceCommand:
         )
         fake = FakeTicker(
             ext,
-            hist,
             daily,
             {"longName": "NVIDIA Corporation", "exchangeTimezoneName": "America/New_York"},
         )
@@ -549,44 +593,40 @@ class TestPriceCommand:
 
         embed = sent_embed(interaction)
         assert embed.title == "NVDA — NVIDIA Corporation"
-        # Latest price comes from the 1-minute extended bar, not the 5m chart.
         assert embed.description == "# $148.50 +$3.50 (+2.41%)"
         assert field_value(embed, "Data") == (
             "Latest: $148.50\nPrevious Close: $145.00\nChange vs prev close: +$3.50 (+2.41%)"
         )
-        # Timestamp matches the extended quote bar (16:05), not the chart's 15:55.
         assert "16:05" in field_value(embed, "Timestamp")
         assert "EST" in field_value(embed, "Timestamp")
         assert "Delayed / latest available" in field_value(embed, "Timestamp")
         assert embed.color == discord.Color.green()
         assert embed.image.url == "attachment://NVDA_chart.png"
         footer = embed.footer.text
-        assert "regular hours" in footer
-        assert footer.endswith("Not real-time")
+        assert "extended hours" in footer
+        assert "5-minute" in footer
+        assert footer.endswith("Delayed, not guaranteed real-time")
 
-        # One fetch per source: extended quote, regular chart, daily close.
+        # One extended-hours fetch plus one daily lookback, no chart fetch.
         assert len([call for call in fake.history_calls if call[0] == "5d"]) == 1
-        assert len([call for call in fake.history_calls if call[0] == "1d"]) == 1
+        assert not [call for call in fake.history_calls if call[0] == "1d"]
         assert len([call for call in fake.history_calls if call[0] == "10d"]) == 1
         assert fake.history_thread_ids[0] != threading.get_ident()
 
         chart_mock.assert_called_once()
-        chart_ticker, chart_frame, chart_change_pct = chart_mock.call_args.args
+        chart_ticker, chart_frame = chart_mock.call_args.args
         assert chart_ticker == "NVDA"
-        assert chart_frame is not hist  # sanitized copy, not the raw response
-        # Chart is the regular-hours frame, whose last bar may differ from the quote.
-        assert chart_frame["Close"].iloc[-1] == pytest.approx(147.0)
-        assert chart_frame.index.tolist() == hist.index.tolist()
-        assert chart_change_pct == pytest.approx(3.5 / 145.0 * 100)
+        assert chart_frame is not ext  # derived frame, not the raw response
+        assert chart_frame.index[-1] == ext.index[-1]
+        assert chart_frame["Close"].iloc[-1] == pytest.approx(148.5)
         assert interaction.followup.send.await_args.kwargs["file"].filename == "NVDA_chart.png"
         assert chart_buffer.closed
 
     @pytest.mark.asyncio
-    async def test_embed_timestamp_and_chart_stay_consistent_with_sources(self):
+    async def test_embed_timestamp_and_chart_share_the_latest_quote_point(self):
         ext = extended_frame(start="2024-01-12 15:57", periods=3, closes=[147.9, 148.1, 148.3])
-        hist = intraday_frame(closes=[145.0, 146.0, 146.5, 147.0])
         daily = daily_frame([("2024-01-11", 145.0)])
-        fake = FakeTicker(ext, hist, daily, {"longName": "Test Corp"})
+        fake = FakeTicker(ext, daily, {"longName": "Test Corp"})
         interaction = make_interaction()
         chart_buffer = png_stub()
 
@@ -596,61 +636,54 @@ class TestPriceCommand:
             await price.callback(interaction, "TEST")
 
         embed = sent_embed(interaction)
-        # Embed timestamp is the extended quote bar's time (15:59).
         assert "15:59" in field_value(embed, "Timestamp")
-        # Embed latest price is the extended bar, not the chart's last bar.
         assert "Latest: $148.30" in field_value(embed, "Data")
-        # Chart data ends at the regular-hours last bar (14:45), not the quote.
         chart_frame = chart_mock.call_args.args[1]
-        assert chart_frame["Close"].iloc[-1] == pytest.approx(147.0)
+        assert chart_frame.index[-1] == ext.index[-1]
+        assert chart_frame["Close"].iloc[-1] == pytest.approx(148.3)
         assert chart_buffer.closed
 
     @pytest.mark.asyncio
     async def test_chartless_quote_sends_embed_without_file(self):
         fake = FakeTicker(
             extended_frame(),
-            pd.DataFrame(),
             daily_frame([("2024-01-11", 145.0)]),
             {"longName": "Test Corp"},
         )
         interaction = make_interaction()
 
         with patch("bot.yf.Ticker", return_value=fake), patch(
-            "bot.generate_chart"
-        ) as chart_mock:
+            "bot._session_chart_frame", return_value=None
+        ), patch("bot.generate_chart") as chart_mock:
             await price.callback(interaction, "TEST")
 
         interaction.followup.send.assert_awaited_once()
         kwargs = interaction.followup.send.await_args.kwargs
         assert kwargs["file"] is None
         assert kwargs["embed"].image.url is None
-        assert "No regular-hours chart" in kwargs["embed"].footer.text
+        assert "No extended-hours chart" in kwargs["embed"].footer.text
         chart_mock.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_chart_api_exception_sends_quote_without_chart(self):
-        # The chart API raises while the extended quote is valid: the embed is
-        # still sent without a file, with the correct quote price and timestamp,
-        # and no misleading generic fetch failure.
+    async def test_chart_aggregation_exception_sends_quote_without_chart(self):
+        # A chart failure must still send the valid extended-hours quote.
         fake = FakeTicker(
             extended_frame(),
-            None,
             daily_frame([("2024-01-11", 145.0)]),
             {"longName": "Test Corp"},
-            intraday_error=RuntimeError("network down"),
         )
         interaction = make_interaction()
 
         with patch("bot.yf.Ticker", return_value=fake), patch(
-            "bot.generate_chart"
-        ) as chart_mock:
+            "bot._session_chart_frame", side_effect=RuntimeError("aggregation failed")
+        ), patch("bot.generate_chart") as chart_mock:
             await price.callback(interaction, "TEST")
 
         interaction.followup.send.assert_awaited_once()
         kwargs = interaction.followup.send.await_args.kwargs
         assert kwargs["file"] is None
         assert kwargs["embed"].image.url is None
-        assert "No regular-hours chart" in kwargs["embed"].footer.text
+        assert "No extended-hours chart" in kwargs["embed"].footer.text
         assert "Latest: $148.50" in field_value(kwargs["embed"], "Data")
         assert "16:05" in field_value(kwargs["embed"], "Timestamp")
         assert "Delayed / latest available" in field_value(kwargs["embed"], "Timestamp")
@@ -667,7 +700,7 @@ class TestPriceCommand:
                 ("2024-01-12", 999.0),
             ]
         )
-        fake = FakeTicker(ext, intraday_frame(), daily, {"longName": "Test Corp"})
+        fake = FakeTicker(ext, daily, {"longName": "Test Corp"})
         interaction = make_interaction()
         chart_buffer = png_stub()
 
@@ -686,7 +719,7 @@ class TestPriceCommand:
     async def test_negative_change_uses_red_embed(self):
         ext = extended_frame(closes=[100, 99, 98, 97])
         daily = daily_frame([("2024-01-11", 100.0)])
-        fake = FakeTicker(ext, intraday_frame(), daily, {"longName": "Test Corp"})
+        fake = FakeTicker(ext, daily, {"longName": "Test Corp"})
         interaction = make_interaction()
         chart_buffer = png_stub()
 
@@ -715,7 +748,7 @@ class TestPriceCommand:
 
     @pytest.mark.asyncio
     async def test_fetch_failure_sends_friendly_ephemeral_message(self):
-        fake = FakeTicker(pd.DataFrame(), intraday_frame())
+        fake = FakeTicker(pd.DataFrame())
         interaction = make_interaction()
 
         with patch("bot.yf.Ticker", return_value=fake), patch("bot.generate_chart") as chart_mock:
@@ -731,7 +764,6 @@ class TestPriceCommand:
     async def test_extended_history_exception_sends_friendly_ephemeral_message(self):
         fake = FakeTicker(
             None,
-            intraday_frame(),
             None,
             extended_error=RuntimeError("Yahoo unavailable"),
         )
@@ -747,7 +779,6 @@ class TestPriceCommand:
     async def test_send_failure_still_closes_chart_buffer(self):
         fake = FakeTicker(
             extended_frame(),
-            intraday_frame(),
             daily_frame([("2024-01-11", 145.0)]),
             {"longName": "Test Corp"},
         )
@@ -769,7 +800,6 @@ class TestPriceCommand:
     async def test_chart_failure_sends_friendly_ephemeral_message(self):
         fake = FakeTicker(
             extended_frame(),
-            intraday_frame(),
             daily_frame([("2024-01-11", 145.0)]),
             {"longName": "Test Corp"},
         )
@@ -786,49 +816,86 @@ class TestPriceCommand:
 
 
 class TestGenerateChart:
-    """Tests for in-memory chart generation and cleanup."""
+    """Tests for dark chart rendering, slope colours and cleanup."""
 
     @staticmethod
-    def _green_red_pixel_counts(buffer):
+    def _image(buffer):
         buffer.seek(0)
-        image = np.asarray(plt.imread(buffer))
-        red, green, blue = image[..., 0], image[..., 1], image[..., 2]
-        green_pixels = int(np.count_nonzero((green > red + 0.1) & (green > blue + 0.1)))
-        red_pixels = int(np.count_nonzero((red > green + 0.1) & (red > blue + 0.1)))
-        return green_pixels, red_pixels
+        return np.asarray(plt.imread(buffer))
 
-    def test_generate_chart_returns_png_and_closes_figure(self):
-        hist = intraday_frame()
-        buffer = generate_chart("TEST", hist, 5.0)
+    @staticmethod
+    def _segment_pixel_counts(image):
+        red, green, blue = image[..., 0], image[..., 1], image[..., 2]
+        rising = int(np.count_nonzero((green > red + 0.1) & (green > blue + 0.1)))
+        falling = int(np.count_nonzero((red > green + 0.1) & (red > blue + 0.1)))
+        flat = int(
+            np.count_nonzero(
+                (np.abs(red - 0x9A / 255) < 0.04)
+                & (np.abs(green - 0xA0 / 255) < 0.04)
+                & (np.abs(blue - 0xA6 / 255) < 0.04)
+            )
+        )
+        return rising, falling, flat
+
+    def test_generate_chart_returns_dark_png_and_closes_figure(self):
+        buffer = generate_chart("TEST", chart_frame())
 
         try:
             buffer.seek(0)
             data = buffer.read()
             assert data.startswith(b"\x89PNG")
             assert len(data) > 500
+
+            image = self._image(buffer)
+            # Both the figure margin and the axes area are dark.
+            assert max(image[0, 0, :3]) < 0.25
+            dark_pixels = image[..., :3].mean(axis=-1) < 0.25
+            assert dark_pixels.mean() > 0.5
             assert plt.get_fignums() == []
         finally:
             buffer.close()
 
-    def test_generate_chart_is_green_for_positive_change(self):
-        buffer = generate_chart("TEST", intraday_frame(), 2.5)
+    def test_generate_chart_colours_each_segment_by_direction(self):
+        # Rising, flat, falling and rising again in one frame.
+        frame = chart_frame(closes=[100.0, 101.0, 101.0, 99.0, 102.0])
+        buffer = generate_chart("TEST", frame)
         try:
-            green_pixels, red_pixels = self._green_red_pixel_counts(buffer)
-            assert green_pixels > 0
-            assert red_pixels == 0
+            rising, falling, flat = self._segment_pixel_counts(self._image(buffer))
+            assert rising > 100
+            assert falling > 100
+            assert flat > 100
             assert plt.get_fignums() == []
         finally:
             buffer.close()
 
-    def test_generate_chart_is_red_for_negative_change(self):
-        buffer = generate_chart("TEST", intraday_frame(), -2.5)
+    def test_generate_chart_shows_both_colours_on_a_net_positive_day(self):
+        # Overall change is positive, but the falling segments stay red.
+        frame = chart_frame(closes=[100.0, 101.0, 100.0, 101.0, 102.0])
+        buffer = generate_chart("TEST", frame)
         try:
-            green_pixels, red_pixels = self._green_red_pixel_counts(buffer)
-            assert red_pixels > 0
-            assert green_pixels == 0
+            rising, falling, _ = self._segment_pixel_counts(self._image(buffer))
+            assert rising > 0
+            assert falling > 0
+        finally:
+            buffer.close()
+
+    def test_generate_chart_handles_a_single_point(self):
+        buffer = generate_chart(
+            "TEST", chart_frame(start="2024-01-12 09:30", closes=[100.0])
+        )
+        try:
+            buffer.seek(0)
+            assert buffer.read().startswith(b"\x89PNG")
             assert plt.get_fignums() == []
         finally:
             buffer.close()
+
+    def test_generate_chart_does_not_change_global_matplotlib_style(self):
+        keys = ("axes.facecolor", "figure.facecolor", "text.color", "grid.color")
+        before = {key: plt.rcParams[key] for key in keys}
+        buffer = generate_chart("TEST", chart_frame())
+        buffer.close()
+        assert {key: plt.rcParams[key] for key in keys} == before
 
 
 class TestCommandRegistration:

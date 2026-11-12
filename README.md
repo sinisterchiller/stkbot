@@ -1,6 +1,6 @@
 # Discord Stock Price Bot
 
-A single-file Discord bot that responds to `/price <ticker>` with the latest available stock price from pre-market, regular and after-hours sessions, the daily change versus the previous trading close, and a 1-day 5-minute regular-hours chart.
+A single-file Discord bot that responds to `/price <ticker>` with the latest available stock price from pre-market, regular and after-hours sessions, the daily change versus the previous trading close, and a dark 1-day 5-minute chart of that same extended-hours session.
 
 ## Features
 
@@ -8,10 +8,10 @@ A single-file Discord bot that responds to `/price <ticker>` with the latest ava
 - **Latest price**: Most recent valid 1-minute close from Yahoo Finance 5-day extended-hours (`prepost=True`) data, spanning pre-market, regular and after-hours sessions; labeled as delayed / latest available, never claimed as real-time
 - **Daily change**: Dollar and percentage change against the latest valid daily close strictly before the quote's exchange-local session date (a pre-market quote on a new day uses the previous regular day's close; an after-hours quote on the same day uses the previous day's close)
 - **Closed markets**: Uses a 10-day daily lookback instead of blindly taking the second-to-last row, and falls back to `info.previousClose` when daily history is unavailable
-- **Chart**: 1-day regular-hours line chart at 5-minute intervals (green = up, red = down) generated in memory as a PNG. It is a separate fetch from the quote and may differ from the latest pre-/after-hours price; when regular-hours data is unavailable the quote is sent without a chart
+- **Chart**: dark-themed 1-day line chart at 5-minute intervals covering the quote's exchange-local session, including pre-market, regular trading and after-hours. It is aggregated from the same 5-day/1-minute extended-hours fetch as the quote (no extra chart request), so it reaches the latest quote timestamp and value. Segments are green when price rises, red when it falls and gray when flat, even when the overall day moved the other way. When the chart cannot be derived the quote is sent without one
 - **Timestamp**: Exchange-local time with timezone label, marked as delayed / latest available
 - **Error handling**: Friendly messages for invalid tickers, empty data, Yahoo Finance failures, and chart/send failures
-- **Non-blocking**: Yahoo Finance history (extended quote, regular-hours chart, daily close) and chart rendering all run in an executor
+- **Non-blocking**: Yahoo Finance history (extended quote plus daily close) and chart rendering all run in an executor
 - **Observable command registration**: the startup log reports whether the slash command sync succeeded, which commands were registered, which servers got a copy, and what to check when it failed
 - **Automatic per-server registration**: every server the bot is in, and every server it joins later, gets its own `/price` registration as soon as the bot is ready — no guild ID or manual step needed
 - **Optional explicit guild**: `DISCORD_GUILD_ID` can still register one server before the gateway connects
@@ -178,23 +178,24 @@ The bot responds with an embed showing:
 - Latest extended-hours price with dollar/percentage change vs the previous trading close
 - Previous trading close for reference
 - Exchange-local data timestamp from the quote bar, labeled as delayed / latest available
-- 1-day 5-minute regular-hours chart as an attachment (omitted when regular-hours data is unavailable)
+- Dark 1-day 5-minute extended-hours chart as an attachment, covering pre-market, regular and after-hours and ending at the latest quote point (omitted when it cannot be derived)
 
 ## How Data Is Selected
 
 1. Fetch extended-hours history once with `period="5d"`, `interval="1m"`, `prepost=True` (pre-market, regular and after-hours).
 2. Drop unusable rows and reject non-positive prices; the last valid bar in chronological order is the quote price, and its own timestamp is the displayed timestamp.
-3. Fetch regular-hours history with `period="1d"`, `interval="5m"` for the chart. If it is empty, the quote is sent without a chart; it is never used as a fallback for the displayed price.
-4. Fetch daily history with `period="10d"`, `interval="1d"`.
-5. Choose the latest valid daily close whose date is strictly earlier than the quote bar's exchange-local session date. This handles weekends, holidays, and stale same-day rows: a pre-market quote on a new day uses the previous regular day's close, and an after-hours quote on the same day uses the previous day's close.
-6. If no valid daily close exists, use a valid `info.previousClose`.
+3. Fetch daily history with `period="10d"`, `interval="1d"`.
+4. Choose the latest valid daily close whose date is strictly earlier than the quote bar's exchange-local session date. This handles weekends, holidays, and stale same-day rows: a pre-market quote on a new day uses the previous regular day's close, and an after-hours quote on the same day uses the previous day's close.
+5. If no valid daily close exists, use a valid `info.previousClose`.
+6. Derive the chart from the extended-hours data already in memory: keep the quote's exchange-local session date (the last weekday session when the data ends on a weekend), resample the 1-minute closes into 5-minute bins taking each bin's last valid close, and append the raw quote point when the quote falls inside a partial final bin. No second chart request is made, and the chart is never used as a fallback for the quote price.
 
 ## Notes
 
 - Data source: **yfinance** (unofficial Yahoo Finance interface) — quotes may be delayed and availability is not guaranteed. The bot labels data as delayed / latest available and does not claim real-time pricing.
 - The displayed price comes from 1-minute extended-hours data (`period="5d"`, `interval="1m"`, `prepost=True`) and covers pre-market, regular and after-hours sessions.
-- The chart is regular-hours only (`period="1d"`, `interval="5m"`) and **may differ from the latest extended-hours quote**; the embed footer says so. The chart endpoint is not the same data as the displayed price.
-- When regular-hours data is unavailable, the quote is sent without a chart rather than failing the command.
+- The chart is a 1-day/5-minute aggregation of that same extended-hours data, not a separate regular-hours endpoint. It covers pre-market, regular and after-hours, ends at the latest quote point, and uses green for rising segments, red for falling segments and gray for flat segments.
+- When the chart cannot be derived, the quote is sent without a chart rather than failing the command.
+- Quotes and charts are delayed and not guaranteed to be real-time; the embed footer labels them that way.
 - No database, caching, or background jobs — one bot file and one slash command.
 - Never commit your actual `.env` file with the token.
 
@@ -207,7 +208,7 @@ pip install -r requirements.txt
 python -m pytest test_bot.py -v
 ```
 
-The suite exercises the real `/price` callback, including defer behavior, one fetch per data source (1-minute extended quote, 5-minute regular-hours chart, daily close), quote/chart source consistency (the embed price and timestamp come from the extended bar while the chart shows the regular-hours frame), chartless quotes when regular-hours data is missing, no stale 5-minute fallback when 1-minute data is missing, closed-session and pre-market previous closes, invalid tickers, empty/error data, and chart buffer cleanup on send failure. Command registration is covered with a mocked command tree: global sync, explicit guild sync (copy-before-sync, exactly one guild-scoped sync, no global clear or global sync), invalid `DISCORD_GUILD_ID` handling, and that startup sync runs once rather than on every reconnect. A real `CommandTree` test verifies that the global command registration survives explicit guild mode while the guild copy exists. Automatic registration is covered with mocked ready/join/leave events: every cached server is registered on ready, reconnects do not repeat REST syncs, joined servers register once, a failing server does not block the others and is retried, and global commands are never cleared.
+The suite exercises the real `/price` callback, including defer behavior, one extended-hours fetch plus one daily lookback and no separate chart fetch, quote/chart consistency (the chart ends at the extended-hours quote timestamp and value), pre-market/regular/after-hours chart coverage, 5-minute bin aggregation, weekend fallback to the last weekday session, chartless quotes when aggregation is unavailable, no stale chart fallback when 1-minute data is missing, closed-session and pre-market previous closes, invalid tickers, empty/error data, and chart buffer cleanup on send failure. Chart tests inspect rendered pixels for a dark background and per-segment green/red/gray colours, including a net-positive day with falling segments. Command registration is covered with a mocked command tree: global sync, explicit guild sync (copy-before-sync, exactly one guild-scoped sync, no global clear or global sync), invalid `DISCORD_GUILD_ID` handling, and that startup sync runs once rather than on every reconnect. A real `CommandTree` test verifies that the global command registration survives explicit guild mode while the guild copy exists. Automatic registration is covered with mocked ready/join/leave events: every cached server is registered on ready, reconnects do not repeat REST syncs, joined servers register once, a failing server does not block the others and is retried, and global commands are never cleared.
 
 ## Deployment
 

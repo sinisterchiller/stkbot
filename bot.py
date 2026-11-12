@@ -13,8 +13,10 @@ import discord
 import matplotlib
 matplotlib.use("Agg")  # Non-interactive backend
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import yfinance as yf
+from matplotlib.collections import LineCollection
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
@@ -26,10 +28,18 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 
 EXTENDED_PERIOD = "5d"
 EXTENDED_INTERVAL = "1m"
-INTRADAY_PERIOD = "1d"
-INTRADAY_INTERVAL = "5m"
 DAILY_PERIOD = "10d"
 DAILY_INTERVAL = "1d"
+CHART_INTERVAL = "5min"
+
+# Chart colours are set on the figure and axes instead of through global
+# matplotlib styles, so importing this module never changes a user's rcParams.
+CHART_BACKGROUND = "#12161c"
+CHART_GRID = "#2c3440"
+CHART_TEXT = "#e6edf3"
+CHART_RISING = "#2ecc71"
+CHART_FALLING = "#e74c3c"
+CHART_FLAT = "#9aa0a6"
 
 # Tickers may contain letters, digits, dots, dashes, carets and equals signs
 # (e.g. BRK-B, ^GSPC, EURUSD=X). Rejecting everything else also keeps the
@@ -275,6 +285,9 @@ class StockQuote:
     change: float
     change_pct: float
     timestamp_label: str
+    # Aggregated 5-minute closes for the quote's exchange-local session,
+    # spanning pre-market, regular trading and after-hours. None when the
+    # chart cannot be derived from the extended-hours data.
     intraday: Optional[pd.DataFrame]
 
 
@@ -369,6 +382,72 @@ def _previous_close(
     return None
 
 
+def _session_chart_frame(
+    extended: pd.DataFrame,
+    latest_ts,
+    latest_price: float,
+    display_tz: Optional[tzinfo],
+) -> Optional[pd.DataFrame]:
+    """
+    Aggregate extended-hours 1-minute closes into the quote's 5-minute session.
+
+    Only the last exchange-local weekday session in the frame is charted, so a
+    weekend request shows the last trading session instead of stale weekend
+    rows. Each 5-minute bin keeps its last valid close, which yields the same
+    1-day/5-minute view Yahoo Finance serves for regular hours but extended to
+    pre-market and after-hours. When the quote sits inside a partial final bin,
+    the raw quote point is appended so the chart ends at the real quote
+    timestamp rather than at the bin's left edge.
+    """
+    try:
+        index = extended.index
+        if getattr(index, "tz", None) is not None and display_tz is not None:
+            index = index.tz_convert(display_tz)
+        local_dates = list(index.date)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if not local_dates:
+        return None
+
+    session_dates = sorted(set(local_dates))
+    session_date = session_dates[-1]
+    if session_date.weekday() >= 5:
+        weekday_dates = [day for day in reversed(session_dates) if day.weekday() < 5]
+        if weekday_dates:
+            session_date = weekday_dates[0]
+
+    session = extended
+    if getattr(session.index, "tz", None) is not None and display_tz is not None:
+        session = session.tz_convert(display_tz)
+    session = session[[day == session_date for day in session.index.date]]
+    if session.empty:
+        return None
+
+    try:
+        closes = session["Close"].resample(CHART_INTERVAL).last().dropna()
+    except (TypeError, ValueError):
+        return None
+    closes = closes[closes > 0]
+    if closes.empty:
+        return None
+
+    quote_ts = latest_ts
+    chart_tz = getattr(closes.index, "tz", None)
+    if getattr(quote_ts, "tzinfo", None) is not None:
+        if chart_tz is None:
+            return None
+        quote_ts = quote_ts.tz_convert(chart_tz)
+
+    if quote_ts.date() == session_date:
+        last_bucket = closes.index[-1]
+        if quote_ts > last_bucket:
+            closes.loc[quote_ts] = latest_price
+        else:
+            closes.iloc[-1] = latest_price
+
+    return closes.sort_index().to_frame("Close")
+
+
 def _format_timestamp(ts, display_tz: Optional[tzinfo]) -> str:
     """Format a data timestamp without falsely claiming a naive time is UTC."""
     if getattr(ts, "tzinfo", None) is not None:
@@ -387,14 +466,15 @@ def fetch_quote(ticker: str) -> Optional[StockQuote]:
     """
     Fetch the latest valid 1-minute extended-hours bar for a ticker.
 
-    The displayed price and timestamp come from a separate 5-day/1-minute
+    The displayed price and timestamp come from a 5-day/1-minute
     ``prepost=True`` fetch that spans pre-market, regular and after-hours
     sessions; the chosen bar is the last chronologically sorted bar with a
     finite positive close, and its own timestamp is the quote timestamp. The
-    1-day/5-minute regular-hours frame is fetched only for the chart and may
-    be empty, in which case the quote is returned without a chart. Daily
-    history is only used to find the previous trading close, with
-    ``info.previousClose`` as a fallback.
+    chart is aggregated from that same fetch (no second chart request): the
+    quote's exchange-local session is resampled into 5-minute bins and the raw
+    quote point is preserved. If the chart cannot be derived the quote is
+    returned without one. Daily history is only used to find the previous
+    trading close, with ``info.previousClose`` as a fallback.
     """
     try:
         ticker_client = yf.Ticker(ticker)
@@ -414,18 +494,6 @@ def fetch_quote(ticker: str) -> Optional[StockQuote]:
     latest_price = _positive_finite(extended["Close"].iloc[-1])
     if latest_price is None:
         return None
-
-    # The regular-hours chart is optional: a fetch failure or an all-invalid
-    # frame must not invalidate the quote already selected above.
-    try:
-        intraday_hist = ticker_client.history(
-            period=INTRADAY_PERIOD,
-            interval=INTRADAY_INTERVAL,
-            auto_adjust=False,
-        )
-    except Exception:
-        intraday_hist = None
-    intraday = _sanitize_intraday(intraday_hist)
 
     info = _safe_info(ticker_client)
     latest_ts = extended.index[-1]
@@ -449,6 +517,15 @@ def fetch_quote(ticker: str) -> Optional[StockQuote]:
     if not math.isfinite(change) or not math.isfinite(change_pct):
         return None
 
+    # The chart is optional: an aggregation failure must not invalidate the
+    # quote that was already selected from the same fetch.
+    try:
+        intraday = _session_chart_frame(
+            extended, latest_ts, latest_price, display_tz
+        )
+    except Exception:
+        intraday = None
+
     company_name = info.get("longName") or info.get("shortName")
     if not isinstance(company_name, str) or not company_name.strip():
         company_name = None
@@ -465,23 +542,116 @@ def fetch_quote(ticker: str) -> Optional[StockQuote]:
     )
 
 
-def generate_chart(
-    ticker: str,
-    intraday: pd.DataFrame,
-    change_pct: float,
-) -> BytesIO:
-    """Render the sanitized intraday frame as an in-memory PNG."""
+def _chart_time_label(ts) -> str:
+    """Format a chart timestamp in its own exchange-local timezone."""
+    if getattr(ts, "tzinfo", None) is not None:
+        return ts.strftime("%Y-%m-%d %H:%M %Z")
+    return ts.strftime("%Y-%m-%d %H:%M")
+
+
+def generate_chart(ticker: str, intraday: pd.DataFrame) -> BytesIO:
+    """Render an extended-hours session frame as a dark in-memory PNG."""
+    if intraday is None or intraday.empty or "Close" not in intraday.columns:
+        raise ValueError("chart frame must contain at least one close")
+
     fig, ax = plt.subplots(figsize=(8, 4), dpi=100)
     buffer = BytesIO()
     try:
-        color = "#1a9850" if change_pct >= 0 else "#d73027"
-        ax.plot(intraday.index, intraday["Close"], color=color, linewidth=1.5)
-        ax.set_title(f"{ticker} — 1D · 5-min · regular hours", fontsize=12, fontweight="bold")
-        ax.set_xlabel("Time", fontsize=10)
-        ax.set_ylabel("Price", fontsize=10)
-        ax.grid(True, alpha=0.3)
+        fig.patch.set_facecolor(CHART_BACKGROUND)
+        ax.set_facecolor(CHART_BACKGROUND)
+
+        closes = intraday["Close"].to_numpy(dtype=float)
+        elapsed = (intraday.index - intraday.index[0]) / pd.Timedelta(minutes=1)
+        positions = np.asarray(elapsed, dtype=float)
+
+        if len(closes) == 1:
+            ax.plot(
+                positions,
+                closes,
+                linestyle="none",
+                marker="o",
+                markersize=5,
+                color=CHART_FLAT,
+            )
+            ax.set_xlim(-1.0, 1.0)
+        else:
+            points = np.column_stack([positions, closes])
+            segments = np.stack([points[:-1], points[1:]], axis=1)
+            changes = np.diff(closes)
+            colors = np.where(
+                changes > 0,
+                CHART_RISING,
+                np.where(changes < 0, CHART_FALLING, CHART_FLAT),
+            )
+            ax.add_collection(
+                LineCollection(segments, colors=colors, linewidths=1.6, zorder=3)
+            )
+            ax.scatter(
+                [positions[-1]],
+                [closes[-1]],
+                s=22,
+                color=colors[-1],
+                edgecolors=CHART_BACKGROUND,
+                linewidths=0.6,
+                zorder=4,
+            )
+            x_span = positions[-1] - positions[0]
+            x_pad = max(x_span * 0.02, 0.5)
+            ax.set_xlim(positions[0] - x_pad, positions[-1] + x_pad)
+
+        low, high = float(np.min(closes)), float(np.max(closes))
+        y_span = high - low
+        y_pad = y_span * 0.12 if y_span > 0 else max(abs(high) * 0.01, 0.5)
+        ax.set_ylim(low - y_pad, high + y_pad)
+
+        tick_count = min(6, len(closes))
+        tick_indices = np.unique(
+            np.linspace(0, len(closes) - 1, tick_count).astype(int)
+        )
+        ax.set_xticks(positions[tick_indices])
+        ax.set_xticklabels(
+            [intraday.index[i].strftime("%H:%M") for i in tick_indices]
+        )
+
+        ax.set_title(
+            f"{ticker} — 1D · 5-min · extended hours (pre/regular/after)",
+            fontsize=11,
+            fontweight="bold",
+            color=CHART_TEXT,
+            pad=10,
+        )
+        ax.set_xlabel("Exchange-local session time", fontsize=9, color=CHART_TEXT)
+        ax.set_ylabel("Price", fontsize=9, color=CHART_TEXT)
+        ax.tick_params(axis="both", colors=CHART_TEXT, labelsize=8)
+        for spine in ax.spines.values():
+            spine.set_color(CHART_GRID)
+        ax.grid(True, color=CHART_GRID, linewidth=0.6, alpha=0.5)
+        ax.set_axisbelow(True)
+
+        ax.annotate(
+            f"Last ${closes[-1]:.2f}\n{_chart_time_label(intraday.index[-1])}",
+            xy=(positions[-1], closes[-1]),
+            xytext=(-10, 10),
+            textcoords="offset points",
+            ha="right",
+            va="bottom",
+            fontsize=8,
+            color=CHART_TEXT,
+            bbox=dict(
+                boxstyle="round,pad=0.25",
+                facecolor=CHART_BACKGROUND,
+                edgecolor=CHART_GRID,
+            ),
+        )
+
         fig.tight_layout()
-        fig.savefig(buffer, format="png", bbox_inches="tight")
+        fig.savefig(
+            buffer,
+            format="png",
+            bbox_inches="tight",
+            facecolor=fig.get_facecolor(),
+            edgecolor="none",
+        )
         buffer.seek(0)
         return buffer
     except Exception:
@@ -518,13 +688,16 @@ def _build_embed(quote: StockQuote) -> discord.Embed:
     if quote.intraday is not None:
         embed.set_footer(
             text=(
-                "Quote: 5d · 1-minute extended hours · Chart: 1D · 5-min · "
-                "regular hours · chart may differ from latest quote · Not real-time"
+                "Quote: 5d · 1-minute extended hours · Chart: same-session 5-minute "
+                "bins (pre-market → after-hours) · Delayed, not guaranteed real-time"
             )
         )
     else:
         embed.set_footer(
-            text="Quote: 5d · 1-minute extended hours · No regular-hours chart available · Not real-time"
+            text=(
+                "Quote: 5d · 1-minute extended hours · No extended-hours chart "
+                "available · Delayed, not guaranteed real-time"
+            )
         )
     return embed
 
@@ -557,7 +730,7 @@ async def on_guild_remove(guild):
 
 @bot.tree.command(
     name="price",
-    description="Get latest stock price (extended hours) with 1D 5-min regular-hours chart",
+    description="Latest stock price (extended hours) with 1D 5-min extended-hours chart",
 )
 @app_commands.describe(ticker="Stock ticker symbol (e.g., NVDA)")
 async def price(interaction: discord.Interaction, ticker: str):
@@ -589,7 +762,7 @@ async def price(interaction: discord.Interaction, ticker: str):
         embed = _build_embed(quote)
         if quote.intraday is not None:
             chart_buffer = await loop.run_in_executor(
-                None, generate_chart, quote.ticker, quote.intraday, quote.change_pct
+                None, generate_chart, quote.ticker, quote.intraday
             )
             filename = f"{quote.ticker}_chart.png"
             embed.set_image(url=f"attachment://{filename}")
