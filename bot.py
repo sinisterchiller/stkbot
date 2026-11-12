@@ -391,30 +391,27 @@ def _session_chart_frame(
     """
     Aggregate extended-hours 1-minute closes into the quote's 5-minute session.
 
-    Only the last exchange-local weekday session in the frame is charted, so a
-    weekend request shows the last trading session instead of stale weekend
-    rows. Each 5-minute bin keeps its last valid close, which yields the same
-    1-day/5-minute view Yahoo Finance serves for regular hours but extended to
-    pre-market and after-hours. When the quote sits inside a partial final bin,
-    the raw quote point is appended so the chart ends at the real quote
-    timestamp rather than at the bin's left edge.
+    The charted session is the exchange-local date of the latest quote bar,
+    whatever weekday it is, so a valid weekend quote keeps its own bars instead
+    of being replaced by an earlier weekday session. When the requested day has
+    no new bars the latest quote bar is itself the last available bar, so its
+    date is already the last session with data. Each 5-minute bin keeps its
+    last valid close, which yields the same 1-day/5-minute view Yahoo Finance
+    serves for regular hours but extended to pre-market and after-hours. When
+    the quote sits inside a partial final bin, the raw quote point is appended
+    so the chart ends at the real quote timestamp rather than at the bin's left
+    edge.
     """
-    try:
-        index = extended.index
-        if getattr(index, "tz", None) is not None and display_tz is not None:
-            index = index.tz_convert(display_tz)
-        local_dates = list(index.date)
-    except (AttributeError, TypeError, ValueError):
-        return None
-    if not local_dates:
+    if extended.empty:
         return None
 
-    session_dates = sorted(set(local_dates))
-    session_date = session_dates[-1]
-    if session_date.weekday() >= 5:
-        weekday_dates = [day for day in reversed(session_dates) if day.weekday() < 5]
-        if weekday_dates:
-            session_date = weekday_dates[0]
+    try:
+        if getattr(latest_ts, "tzinfo", None) is not None and display_tz is not None:
+            session_date = latest_ts.astimezone(display_tz).date()
+        else:
+            session_date = latest_ts.date()
+    except (AttributeError, TypeError, ValueError):
+        return None
 
     session = extended
     if getattr(session.index, "tz", None) is not None and display_tz is not None:

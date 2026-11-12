@@ -481,8 +481,9 @@ class TestFetchQuote:
         assert chart.index[-1].strftime("%H:%M") == "09:35"
         assert chart["Close"].iloc[-1] == pytest.approx(105.0)
 
-    def test_weekend_quote_charts_last_weekday_session(self):
-        # Stale weekend rows must not replace the last real trading session.
+    def test_weekend_quote_charts_weekend_session(self):
+        # A valid Saturday quote must be charted: the chart ends at that quote
+        # timestamp and price instead of falling back to Friday's session.
         friday = extended_frame(
             start="2024-01-12 15:57", periods=4, closes=[101, 102, 103, 104]
         )
@@ -504,8 +505,30 @@ class TestFetchQuote:
         assert quote.intraday is not None
         chart = quote.intraday
         assert {timestamp.date() for timestamp in chart.index} == {
+            pd.Timestamp("2024-01-13").date()
+        }
+        assert chart.index[-1] == ext.index[-1]
+        assert chart["Close"].iloc[-1] == pytest.approx(106.0)
+
+    def test_weekend_request_with_only_friday_bars_charts_friday(self):
+        # No bars arrive over the weekend, so the latest quote bar is Friday's
+        # last bar and the chart naturally keeps that Friday session.
+        ext = extended_frame(
+            start="2024-01-12 15:57", periods=4, closes=[101, 102, 103, 104]
+        )
+        daily = daily_frame([("2024-01-11", 100.0)])
+        fake = FakeTicker(ext, daily, {"longName": "Test Corp"})
+
+        with patch("bot.yf.Ticker", return_value=fake):
+            quote = fetch_quote("TEST")
+
+        assert quote is not None
+        assert quote.intraday is not None
+        chart = quote.intraday
+        assert {timestamp.date() for timestamp in chart.index} == {
             pd.Timestamp("2024-01-12").date()
         }
+        assert chart.index[-1] == ext.index[-1]
         assert chart["Close"].iloc[-1] == pytest.approx(104.0)
 
     def test_chart_aggregation_failure_keeps_quote_without_chart(self):
