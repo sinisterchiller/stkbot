@@ -1,4 +1,9 @@
-"""Discord stock price bot with /price slash command."""
+"""Discord stock price bot with /price and one-shot price alerts.
+
+Slash commands: /price, /remind, /reminders, /unremind and /help. A background
+task checks pending alerts once every 60 seconds and notifies their owners in
+the original guild channel; alerts persist in a local SQLite database.
+"""
 
 import asyncio
 import math
@@ -18,9 +23,11 @@ import pandas as pd
 import yfinance as yf
 from matplotlib.collections import LineCollection
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from reminders import ReminderStore
 
 load_dotenv()
 
@@ -61,6 +68,21 @@ SYNC_TROUBLESHOOTING = (
 # left unsynced for the next ready pass (reconnect or restart) to retry.
 GUILD_SYNC_ATTEMPTS = 3
 GUILD_SYNC_RETRY_DELAY = 5.0
+
+# Seconds between price-alert checks. discord.py does not auto-start ext.tasks
+# loops, so this loop is started exactly once in StockPriceBot.setup_hook.
+ALERT_CHECK_SECONDS = 60
+
+# Discord caps an embed at 25 fields and a message at 10 embeds, and counts
+# an embed's title, description, field names/values, footer and author text
+# toward a 6000-character total (a message's embed texts together count
+# against the same 6000 characters). Batching therefore caps both field
+# counts and character totals, using a safety margin below the 6000 cap so
+# Unicode and client rounding can never push a real message over the limit.
+REMINDER_FIELDS_PER_EMBED = 25
+REMINDER_EMBEDS_PER_MESSAGE = 10
+REMINDER_EMBED_CHAR_BUDGET = 5500
+REMINDER_MESSAGE_CHAR_BUDGET = 5500
 
 
 def parse_guild_id(raw: Optional[str]) -> Optional[int]:
@@ -207,11 +229,17 @@ class StockPriceBot(commands.Bot):
         self._synced_guild_ids: set[int] = set()
         self._syncing_guild_ids: set[int] = set()
         self._guild_sync_lock = asyncio.Lock()
+        self._price_alerts_started = False
 
     async def setup_hook(self) -> None:
         guild_id = get_guild_id()
         if await sync_commands(self.tree) and guild_id is not None:
             self._synced_guild_ids.add(guild_id)
+        # setup_hook runs once per process (reconnects only fire on_ready),
+        # so this guard keeps the alert loop from ever being started twice.
+        if not self._price_alerts_started:
+            self._price_alerts_started = True
+            price_alerts_loop.start()
 
     async def sync_guild(self, guild) -> bool:
         """
@@ -268,6 +296,16 @@ class StockPriceBot(commands.Bot):
     def forget_guild(self, guild_id: int) -> None:
         """Drop sync state so rejoining the guild registers commands again."""
         self._synced_guild_ids.discard(guild_id)
+
+    async def close(self) -> None:
+        """Stop the price-alert loop, then shut the client down.
+
+        discord.py does not cancel ext.tasks loops on shutdown, so the loop is
+        cancelled here before super's close, which is idempotent and awaited
+        even when the bot never connected.
+        """
+        price_alerts_loop.cancel()
+        await super().close()
 
 
 intents = discord.Intents.default()
@@ -539,6 +577,47 @@ def fetch_quote(ticker: str) -> Optional[StockQuote]:
     )
 
 
+@dataclass(frozen=True)
+class LatestPrice:
+    """Lightweight quote result: the last valid bar and its timestamp."""
+
+    price: float
+    timestamp: object
+
+
+def fetch_latest_price(ticker: str) -> Optional[LatestPrice]:
+    """
+    Lightweight latest-price lookup for /remind and the alert checker.
+
+    Exactly one 5-day/1-minute extended-hours history fetch is made (no
+    ``info``, no daily history, no chart request). The quote is the last
+    chronologically valid finite positive close selected by the existing
+    sanitizer, paired with that bar's own timestamp. Returns None on a
+    Yahoo Finance error, empty data, or no usable bar. Synchronous and
+    blocking: callers must run it via ``asyncio.to_thread``.
+    """
+    try:
+        client = yf.Ticker(ticker)
+        extended_hist = client.history(
+            period=EXTENDED_PERIOD,
+            interval=EXTENDED_INTERVAL,
+            prepost=True,
+            auto_adjust=False,
+        )
+    except Exception:
+        return None
+
+    extended = _sanitize_intraday(extended_hist)
+    if extended is None:
+        return None
+
+    price = _positive_finite(extended["Close"].iloc[-1])
+    if price is None:
+        return None
+
+    return LatestPrice(price=price, timestamp=extended.index[-1])
+
+
 def _chart_time_label(ts) -> str:
     """Format a chart timestamp in its own exchange-local timezone."""
     if getattr(ts, "tzinfo", None) is not None:
@@ -781,6 +860,435 @@ async def price(interaction: discord.Interaction, ticker: str):
             chart_file.close()
         if chart_buffer is not None:
             chart_buffer.close()
+
+
+# ---------------------------------------------------------------------------
+# Price alerts: /remind, /reminders, /unremind and the 60-second checker.
+
+reminder_store = ReminderStore()
+
+
+def _build_remind_embed(
+    reminder_id: int,
+    ticker: str,
+    direction: str,
+    target_price: float,
+    quote: LatestPrice,
+) -> discord.Embed:
+    """Ephemeral confirmation embed for a newly created price alert."""
+    direction_text = "rising above" if direction == "above" else "falling below"
+    embed = discord.Embed(
+        title=f"Price alert #{reminder_id} set",
+        description=(
+            f"**{ticker}** {direction_text} **${target_price:.2f}**\n"
+            f"Current: ${quote.price:.2f}\n"
+            f"Quote as of {_format_timestamp(quote.timestamp, None)} — "
+            "delayed / latest available, not real-time"
+        ),
+        color=discord.Color.green() if direction == "above" else discord.Color.red(),
+    )
+    embed.add_field(name="ID", value=str(reminder_id), inline=True)
+    embed.add_field(name="Ticker", value=ticker, inline=True)
+    embed.add_field(name="Target", value=f"${target_price:.2f}", inline=True)
+    embed.add_field(name="Current", value=f"${quote.price:.2f}", inline=True)
+    embed.add_field(name="Direction", value=direction, inline=True)
+    return embed
+
+
+def _reminder_field_for(row: dict) -> tuple[str, str]:
+    """The one field an alert row becomes in a /reminders embed.
+
+    Field names and values are built from bounded inputs (integer ID,
+    TICKER_PATTERN ticker, positive finite price with ``%.2f``), so they
+    always stay inside Discord's 256-character name and 1024-character value
+    limits without truncation.
+    """
+    return (
+        f"#{row['id']} {row['ticker']}",
+        f"${row['target_price']:.2f} ({row['direction']})",
+    )
+
+
+def _reminder_embed_char_count(embed: discord.Embed) -> int:
+    """Total embed text length counted the way Discord counts it.
+
+    Discord sums title, description, every field's name and value, footer
+    text and author name toward the 6000-character embed cap, so this is the
+    number the budgeting code must keep under REMINDER_EMBED_CHAR_BUDGET.
+    """
+    total = 0
+    if embed.title:
+        total += len(embed.title)
+    if embed.description:
+        total += len(embed.description)
+    for field in embed.fields:
+        total += len(field.name) + len(field.value)
+    if embed.footer is not None and embed.footer.text:
+        total += len(embed.footer.text)
+    if embed.author is not None and embed.author.name:
+        total += len(embed.author.name)
+    return total
+
+
+def _reminder_embed_messages(embeds: list[discord.Embed]) -> list[list[discord.Embed]]:
+    """Split embeds into messages inside Discord's per-message limits.
+
+    Each message holds at most REMINDER_EMBEDS_PER_MESSAGE embeds, and the
+    sum of their embed text lengths must stay within
+    REMINDER_MESSAGE_CHAR_BUDGET (a safety margin below Discord's 6000
+    character per-message embed cap). Order is preserved, so a long list
+    becomes several ephemeral follow-up messages with no alert missing.
+    """
+    messages: list[list[discord.Embed]] = []
+    current: list[discord.Embed] = []
+    current_chars = 0
+    for embed in embeds:
+        chars = _reminder_embed_char_count(embed)
+        if current and (
+            len(current) >= REMINDER_EMBEDS_PER_MESSAGE
+            or current_chars + chars > REMINDER_MESSAGE_CHAR_BUDGET
+        ):
+            messages.append(current)
+            current = []
+            current_chars = 0
+        current.append(embed)
+        current_chars += chars
+    if current:
+        messages.append(current)
+    return messages
+
+
+def _build_reminder_embeds(rows: list[dict]) -> list[discord.Embed]:
+    """Embeds for /reminders, chunked inside Discord's per-embed limits.
+
+    A new embed starts when the field count would reach
+    REMINDER_FIELDS_PER_EMBED or the embed's total text would exceed
+    REMINDER_EMBED_CHAR_BUDGET (a safety margin below Discord's 6000
+    character embed cap), so even extremely long formatted prices keep
+    every embed within the limits without truncating any alert.
+    """
+    embeds: list[discord.Embed] = []
+    embed: Optional[discord.Embed] = None
+    for row in rows:
+        name, value = _reminder_field_for(row)
+        field_chars = len(name) + len(value)
+        if (
+            embed is None
+            or len(embed.fields) >= REMINDER_FIELDS_PER_EMBED
+            or _reminder_embed_char_count(embed) + field_chars
+            > REMINDER_EMBED_CHAR_BUDGET
+        ):
+            if embed is not None:
+                embeds.append(embed)
+            embed = discord.Embed(
+                title="Your pending price alerts",
+                color=discord.Color.blue(),
+            )
+        embed.add_field(name=name, value=value, inline=True)
+    if embed is not None:
+        embeds.append(embed)
+    return embeds
+
+
+def _alert_message(row: dict, quote: LatestPrice) -> str:
+    """Alert text mentioning the owner; user mentions only, delayed caveat."""
+    direction_text = "rose above" if row["direction"] == "above" else "fell below"
+    return (
+        f"<@{row['user_id']}> 🔔 **{row['ticker']}** {direction_text} its target: "
+        f"latest ${quote.price:.2f} vs target ${row['target_price']:.2f}.\n"
+        f"Quote as of {_format_timestamp(quote.timestamp, None)} — "
+        "delayed / latest available, not real-time."
+    )
+
+
+async def _resolve_alert_channel(channel_id: int):
+    """Cached channel lookup first, then a REST fetch; None on any failure."""
+    try:
+        channel = bot.get_channel(channel_id)
+        if channel is None:
+            channel = await bot.fetch_channel(channel_id)
+    except Exception:
+        return None
+    return channel
+
+
+async def check_price_alerts() -> None:
+    """
+    Run one 60-second alert cycle.
+
+    Loads every pending reminder, fetches one lightweight quote per unique
+    ticker, and for each due reminder (price >= target for 'above',
+    <= target for 'below') sends a user-mentioning message to the original
+    guild channel. The reminder is deleted only after a successful send;
+    any channel lookup, quote fetch, or send failure retains it for the
+    next cycle. DM channels never receive alerts.
+    """
+    pending = await asyncio.to_thread(reminder_store.list_all)
+    if not pending:
+        return
+
+    unique_tickers = {row["ticker"] for row in pending}
+    quotes: dict[str, Optional[LatestPrice]] = {}
+    for ticker in sorted(unique_tickers):
+        try:
+            quotes[ticker] = await asyncio.to_thread(fetch_latest_price, ticker)
+        except Exception as exc:
+            print(f"WARNING: quote fetch failed for {ticker}: {type(exc).__name__}")
+            quotes[ticker] = None
+
+    for row in pending:
+        quote = quotes.get(row["ticker"])
+        if quote is None:
+            # Yahoo unavailable for this ticker; keep the alert for next cycle.
+            continue
+
+        target = row["target_price"]
+        if row["direction"] == "above":
+            due = quote.price >= target
+        else:
+            due = quote.price <= target
+        if not due:
+            # Stale closed-market quotes persist, and a direction set away
+            # from the current price never fires on that stale value.
+            continue
+
+        channel = await _resolve_alert_channel(row["channel_id"])
+        if channel is None or getattr(channel, "guild", None) is None:
+            print(
+                f"WARNING: alert #{row['id']} ({row['ticker']}) retained: "
+                "channel unavailable or not a guild channel."
+            )
+            continue
+
+        try:
+            await channel.send(
+                _alert_message(row, quote),
+                allowed_mentions=discord.AllowedMentions(
+                    # Restrict mentions to the alert owner's user ID exactly;
+                    # @everyone, @role and replied-user mentions must stay off.
+                    users=[discord.Object(id=row["user_id"])],
+                    everyone=False,
+                    roles=False,
+                    replied_user=False,
+                ),
+            )
+        except Exception as exc:
+            print(
+                f"WARNING: alert #{row['id']} ({row['ticker']}) send failed: "
+                f"{type(exc).__name__}"
+            )
+            continue
+
+        deleted = await asyncio.to_thread(reminder_store.delete_by_id_only, row["id"])
+        if not deleted:
+            print(
+                f"WARNING: alert #{row['id']} sent but delete failed; it may be "
+                "re-sent on the next cycle."
+            )
+
+
+@tasks.loop(seconds=ALERT_CHECK_SECONDS)
+async def price_alerts_loop():
+    """
+    60-second alert cycle with a ready guard.
+
+    Started once in setup_hook; skipped while the bot is not ready, so a
+    reconnect can never spawn a second loop. One cycle at a time (the loop
+    waits for each cycle to finish), so reminders are never notified twice.
+    """
+    if not bot.is_ready():
+        return
+    try:
+        await check_price_alerts()
+    except Exception as exc:
+        print(f"WARNING: price alert cycle failed: {type(exc).__name__}")
+
+
+@bot.tree.command(
+    name="remind",
+    description="Set a one-shot price alert for a ticker",
+)
+@app_commands.describe(ticker="Stock ticker symbol (e.g., NVDA)")
+@app_commands.describe(target="Target price to alert on")
+async def remind(interaction: discord.Interaction, ticker: str, target: float):
+    """Slash command to set a one-shot price alert.
+
+    The direction is derived from the fetched price (target above current
+    means 'above', below means 'below'), and a target equal to the current
+    price at displayed precision is rejected, so an alert created on a
+    stale closed-market quote cannot fire on that same stale value.
+    """
+    # Ephemeral defer keeps the private confirmation and every follow-up
+    # response visible only to the invoking user.
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    normalized = ticker.strip().upper()
+    channel = interaction.channel
+    guild = getattr(channel, "guild", None)
+    if guild is None:
+        await interaction.followup.send(
+            "Price alerts only work in server channels, not DMs.",
+            ephemeral=True,
+        )
+        return
+
+    if not TICKER_PATTERN.fullmatch(normalized):
+        await interaction.followup.send(
+            f"❌ **{discord.utils.escape_markdown(normalized) or 'Input'}** is not a valid ticker symbol. "
+            "Try something like `NVDA`, `BRK-B`, or `^GSPC`.",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        target_price = float(target)
+    except (TypeError, ValueError):
+        target_price = None
+    if target_price is None or not math.isfinite(target_price) or target_price <= 0:
+        await interaction.followup.send(
+            "❌ The target price must be a positive number (e.g., `150`).",
+            ephemeral=True,
+        )
+        return
+
+    quote = await asyncio.to_thread(fetch_latest_price, normalized)
+    if quote is None:
+        await interaction.followup.send(
+            f"❌ Could not fetch a latest price for **{normalized}**. Invalid symbol, "
+            "no market data, or a temporary Yahoo Finance error. Try again shortly.",
+            ephemeral=True,
+        )
+        return
+
+    if round(quote.price, 2) == round(target_price, 2):
+        await interaction.followup.send(
+            f"❌ **{normalized}** is already trading at ${target_price:.2f}. "
+            "Choose a target away from the current price.",
+            ephemeral=True,
+        )
+        return
+
+    direction = "above" if target_price > quote.price else "below"
+    reminder_id = await asyncio.to_thread(
+        reminder_store.add_reminder,
+        interaction.user.id,
+        channel.id,
+        normalized,
+        target_price,
+        direction,
+    )
+    await interaction.followup.send(
+        embed=_build_remind_embed(reminder_id, normalized, direction, target_price, quote),
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="reminders", description="List your pending price alerts")
+async def reminders(interaction: discord.Interaction):
+    """Slash command to list the invoking user's pending alerts (ephemeral).
+
+    Long lists are split across several ephemeral follow-up messages, each
+    holding at most 10 embeds whose combined text length stays within
+    Discord's per-message limit, and each embed stays within the 25-field and
+    6000-character embed limits, so the full list is always shown.
+    """
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    rows = await asyncio.to_thread(reminder_store.list_by_user, interaction.user.id)
+    if not rows:
+        await interaction.followup.send(
+            "You have no pending price alerts. Use /remind to create one.",
+            ephemeral=True,
+        )
+        return
+
+    for message_embeds in _reminder_embed_messages(_build_reminder_embeds(rows)):
+        await interaction.followup.send(embeds=message_embeds, ephemeral=True)
+
+
+@bot.tree.command(name="unremind", description="Cancel one of your price alerts by ID")
+@app_commands.describe(id="Alert ID shown by /reminders")
+async def unremind(interaction: discord.Interaction, id: int):
+    """Slash command to cancel one of the invoking user's alerts (owner only)."""
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    deleted = await asyncio.to_thread(reminder_store.delete_by_id, id, interaction.user.id)
+    if deleted:
+        await interaction.followup.send(f"✅ Alert #{id} cancelled.", ephemeral=True)
+    else:
+        await interaction.followup.send(
+            f"❌ No pending alert with ID {id} belongs to you. Check /reminders.",
+            ephemeral=True,
+        )
+
+
+def _build_help_embed() -> discord.Embed:
+    """The private /help guide: one field per command plus a how-alerts-work note.
+
+    Field names and values are static and short, so every field stays well
+    inside Discord's 256-character name and 1024-character value limits and
+    the whole embed stays inside the 6000-character embed cap.
+    """
+    embed = discord.Embed(
+        title="Stock bot commands",
+        description=(
+            "This guide, and reminder confirmations and lists, are private "
+            "(ephemeral). /price answers are public in the channel, and fired "
+            "alerts post in the channel where you created them, mentioning you."
+        ),
+        color=discord.Color.blue(),
+    )
+    embed.add_field(
+        name="/price <ticker>",
+        value=(
+            "Latest extended-hours price with a 1-day, 5-minute chart, posted "
+            "publicly in the channel. Data comes from Yahoo Finance and can be "
+            "delayed — not real-time."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="/remind <ticker> <target>",
+        value=(
+            "Set a one-shot price alert (server channels only). The direction "
+            "(above/below) is chosen automatically from the current price, and "
+            "you get a private confirmation with the alert ID."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="/reminders",
+        value=(
+            "List only your pending alerts, privately. This is where you get "
+            "the alert IDs used by /unremind."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="/unremind <id>",
+        value="Cancel one of your alerts using the ID shown by /reminders.",
+        inline=False,
+    )
+    embed.add_field(
+        name="How alerts work",
+        value=(
+            "Checked once every 60 seconds; each alert fires exactly once and "
+            "mentions you in the channel where you created it. Yahoo data can "
+            "be delayed and is not real-time."
+        ),
+        inline=False,
+    )
+    return embed
+
+
+@bot.tree.command(name="help", description="Show how to use this bot's commands")
+async def help(interaction: discord.Interaction):
+    """Slash command that privately explains every command and how alerts work.
+
+    The response is ephemeral, so it is visible only to the invoking user and
+    can never leak one user's alerts or details to the channel.
+    """
+    await interaction.response.send_message(embed=_build_help_embed(), ephemeral=True)
 
 
 def main():
