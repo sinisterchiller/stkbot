@@ -4,6 +4,141 @@ All notable changes to the Discord stock price bot. The project has no tagged
 releases; this file records what changed on `dev` before it was merged into
 `main`.
 
+## Unreleased — `dev-feature-price-alerts` merged into `main` (2026-11-11)
+
+This merge brings one-shot stock price alerts and a private `/help` guide
+from `dev-feature-price-alerts` (`7fe6d80..7f1af9c`) onto `main`. Everything
+below is a change relative to the previous `main` commit `7fe6d80`; the
+baseline behavior that already existed on `main` is listed separately at
+the end.
+
+### Added
+
+- **`/remind <ticker> <target>` — one-shot price alerts (server channels
+  only).** The command defers ephemerally, validates the ticker
+  (`TICKER_PATTERN`) and a positive finite target, then fetches one
+  lightweight latest price: a single 5-day/1-minute `prepost=True` history
+  request covering pre-market, regular and after-hours — no `info`, no daily
+  history and no chart request. The alert direction is derived from the
+  current price: **above** when the target is above it, **below** when it is
+  below. A target equal to the current price at displayed 2-decimal
+  precision is rejected, so an alert created on a stale closed-market quote
+  can never fire on that same stale value. The confirmation is ephemeral and
+  shows the alert ID, ticker, current price, target, direction and the quote
+  timestamp with a delayed-data disclaimer.
+- **`/reminders` — owner-only pending alert list (ephemeral).** Lists only
+  the invoking user's alerts (ID, ticker, target, direction). Embeds are
+  chunked to stay inside Discord's per-embed limits (at most 25 fields and a
+  5500-character text budget below the 6000-character cap), and each message
+  holds at most 10 embeds whose combined text stays within a 5500-character
+  per-message budget, so very long lists are split across several ephemeral
+  follow-up messages with no alert missing.
+- **`/unremind <id>` — owner-only cancellation (ephemeral).** Deletes the
+  alert only when the invoking user owns it; other users' alerts are never
+  visible or deletable.
+- **`/help` — private command guide (ephemeral).** A single ephemeral embed
+  describing `/price`, `/remind`, `/reminders` and `/unremind` plus how
+  alerts work, including which responses are private and which are public.
+- **SQLite persistence layer (`reminders.py`).** A thin CRUD store
+  (`ReminderStore`) over a SQLite database at `reminders.db` next to
+  `reminders.py` — a path stable under systemd regardless of the working
+  directory. Every call opens its own short-lived connection with
+  `PRAGMA journal_mode=WAL`. The `reminders` table stores the alert ID, owner
+  user ID, channel ID, ticker, target price, direction and creation
+  timestamp. The database file and its `-wal`, `-shm` and `-journal` side
+  files are gitignored, so the file stays in the server's
+  `/home/server/stkbot` checkout and pending alerts survive restarts and
+  deploys.
+- **60-second alert checker.** A single `@tasks.loop(seconds=60)` background
+  task is started exactly once in `setup_hook` (a `_price_alerts_started`
+  guard prevents a double start on reconnect) and is cancelled in the bot's
+  `close()`, so shutdown is clean. Each cycle loads every pending reminder,
+  fetches one lightweight quote per unique ticker in executor threads (the
+  event loop is never blocked), and fires an alert once its price reaches the
+  target: direction `above` fires at `price >= target`, direction `below` at
+  `price <= target`. The owner is mentioned in the original guild channel
+  with user-only `allowed_mentions` (`users=[owner]`, `everyone=False`,
+  `roles=False`, `replied_user=False`), so `@everyone`, role and
+  replied-user mentions stay off. The channel is resolved via
+  `bot.get_channel` with a `bot.fetch_channel` REST fallback, and DM channels
+  never receive alerts.
+- **Send-then-delete semantics.** A reminder is deleted only after its
+  notification message has been sent successfully; any channel-lookup, quote
+  fetch or send failure retains the reminder for the next cycle.
+- **Expanded tests.** The suite grew from 61 test functions (96 collected
+  test cases) on the previous `main` baseline to 138 test functions (174
+  collected test cases including parameterization): 115 in `test_bot.py` and
+  23 in the new `test_reminders.py`. New coverage includes the lightweight
+  quote helper (exactly one 5d/1m fetch), `/remind` validation (invalid
+  ticker, non-positive target, DM channel, equal current price, executor
+  threading) and persistence, `/reminders` owner-only listing with embed
+  chunking and multi-message character-budget batching (250+ alerts),
+  `/unremind` owner-only cancellation, the 60-second cycle (unique-ticker
+  quote fetches, upward/downward/equal triggers, one-time notification,
+  failed fetch/send retention, DM and unavailable-channel retention,
+  `get_channel`→`fetch_channel` fallback, persistence across a simulated
+  restart, loop started exactly once, ready guard and clean stop on close),
+  and the SQLite storage layer (schema, validation, user isolation,
+  owner-checked and ID-only deletes).
+
+### Changed
+
+- `bot.py` now imports `reminders.ReminderStore` and `discord.ext.tasks` and
+  creates a module-level `reminder_store`; `StockPriceBot.setup_hook` starts
+  the alert loop once, and a new `StockPriceBot.close()` cancels it before
+  shutting the client down.
+- `.gitignore` now ignores `reminders.db` plus its `-wal`, `-shm` and
+  `-journal` side files.
+- `README.md` documents the new commands, alert persistence, batching
+  limits and the expanded test coverage.
+
+### Behavior notes and limitations
+
+- **Privacy.** `/price` answers remain public in the channel, and fired
+  alerts are posted publicly in the channel where they were created,
+  mentioning the owner. The management surface — `/remind` confirmations,
+  `/reminders` lists, `/unremind` results and `/help` — is private
+  (ephemeral), so one user's alerts are never visible to other users.
+- **Delivery is at-least-once, not exactly-once.** The reminder is deleted
+  only after a successful send, which prevents the usual duplicate path. If
+  the message is sent but the database delete fails, the alert may be
+  re-sent on the next cycle; that is the only known duplicate path.
+- **Timing and data caveats.** Alerts are checked once every 60 seconds
+  against Yahoo Finance data via yfinance, an unofficial interface: quotes
+  may be delayed, extended-hours availability varies by ticker, and no
+  tick-perfect trigger is guaranteed. Fired alerts carry the quote timestamp
+  and a "delayed / latest available, not real-time" caveat. When the market
+  is closed the same stale quote persists, and because alert directions are
+  always set away from the current price at creation, a stale quote can never
+  trigger its own alert automatically.
+- **Existing `/price` and chart behavior is unchanged.** The extended-hours
+  quote, previous-close selection, dark per-segment 5-minute chart and
+  chartless-quote degradation from the previous release all work exactly as
+  before; the alert path reuses the same quote sanitization with a lighter
+  fetch.
+
+### Commits merged
+
+| Commit | Summary |
+| --- | --- |
+| `35f3c13` | SQLite persistence layer for stock price reminders |
+| `fb038d5` | One-shot price alerts with /remind, /reminders, /unremind and 60-second checker |
+| `1c73a5e` | Private alerts, clean loop shutdown, restricted mentions, batched /reminders lists |
+| `4731e4d` | Size /reminders embed batches to Discord's 6000-character embed limits |
+| `2163ec2` | Private /help slash command with tests and README docs |
+| `a30c110` | Correct /help privacy claims to match actual visibility |
+| `7f1af9c` | Fix /help crash: use InteractionResponse.send_message |
+
+### Baseline already on `main` before this merge
+
+These behaviors existed at `7fe6d80` and are not part of this merge's changes:
+
+- The `/price` slash command with its extended-hours quote, previous-close
+  selection, dark per-segment 5-minute chart and chartless-quote degradation.
+- Per-server command registration and startup sync logging.
+- Error handling, executor-based non-blocking fetches/chart rendering, chart
+  buffer cleanup, and the GitHub Actions self-hosted deployment workflow.
+
 ## Unreleased — `dev` merged into `main` (2026-11-11)
 
 This merge brings the extended-hours quote and chart work from `dev`
