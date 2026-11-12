@@ -322,11 +322,8 @@ def _sanitize_intraday(hist) -> Optional[pd.DataFrame]:
 
     frame = hist.loc[:, ["Close"]].copy()
     closes = pd.to_numeric(frame["Close"], errors="coerce")
-    finite = closes.map(_is_finite)
-    valid_closes = closes[finite].astype(float)
-    if len(valid_closes) and (valid_closes <= 0).any():
-        return None
-    frame = frame[finite]
+    valid = closes.map(_is_finite) & (closes > 0)
+    frame = frame[valid]
     if frame.empty:
         return None
 
@@ -407,11 +404,6 @@ def fetch_quote(ticker: str) -> Optional[StockQuote]:
             prepost=True,
             auto_adjust=False,
         )
-        intraday_hist = ticker_client.history(
-            period=INTRADAY_PERIOD,
-            interval=INTRADAY_INTERVAL,
-            auto_adjust=False,
-        )
     except Exception:
         return None
 
@@ -422,6 +414,18 @@ def fetch_quote(ticker: str) -> Optional[StockQuote]:
     latest_price = _positive_finite(extended["Close"].iloc[-1])
     if latest_price is None:
         return None
+
+    # The regular-hours chart is optional: a fetch failure or an all-invalid
+    # frame must not invalidate the quote already selected above.
+    try:
+        intraday_hist = ticker_client.history(
+            period=INTRADAY_PERIOD,
+            interval=INTRADAY_INTERVAL,
+            auto_adjust=False,
+        )
+    except Exception:
+        intraday_hist = None
+    intraday = _sanitize_intraday(intraday_hist)
 
     info = _safe_info(ticker_client)
     latest_ts = extended.index[-1]
@@ -457,7 +461,7 @@ def fetch_quote(ticker: str) -> Optional[StockQuote]:
         change=change,
         change_pct=change_pct,
         timestamp_label=_format_timestamp(latest_ts, display_tz),
-        intraday=_sanitize_intraday(intraday_hist),
+        intraday=intraday,
     )
 
 

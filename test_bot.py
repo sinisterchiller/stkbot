@@ -385,8 +385,7 @@ class TestFetchQuote:
             pd.DataFrame(),
             pd.DataFrame({"Open": [100.0]}, index=pd.date_range("2024-01-12", periods=1, freq="1min", tz="UTC")),
             pd.DataFrame({"Close": [np.nan, np.nan]}, index=pd.date_range("2024-01-12", periods=2, freq="1min", tz="UTC")),
-            pd.DataFrame({"Close": [-1.0, 2.0]}, index=pd.date_range("2024-01-12", periods=2, freq="1min", tz="UTC")),
-            pd.DataFrame({"Close": [0.0, 2.0]}, index=pd.date_range("2024-01-12", periods=2, freq="1min", tz="UTC")),
+            pd.DataFrame({"Close": [-1.0, 0.0]}, index=pd.date_range("2024-01-12", periods=2, freq="1min", tz="UTC")),
             pd.DataFrame(
                 {"Close": pd.array([pd.NA, pd.NA], dtype="Float64")},
                 index=pd.date_range("2024-01-12", periods=2, freq="1min", tz="UTC"),
@@ -400,9 +399,11 @@ class TestFetchQuote:
         with patch("bot.yf.Ticker", return_value=fake):
             assert fetch_quote("BAD") is None
 
-    def test_trailing_na_uses_last_valid_extended_bar(self):
+    @pytest.mark.parametrize("trailing", [pd.NA, np.nan, 0.0, -5.0, float("inf")])
+    def test_trailing_invalid_uses_last_valid_extended_bar(self, trailing):
+        # A bad trailing bar must not invalidate the last valid bar before it.
         ext = pd.DataFrame(
-            {"Close": pd.array([147.0, 148.0, pd.NA], dtype="Float64")},
+            {"Close": [147.0, 148.0, trailing]},
             index=pd.date_range("2024-01-12 15:57", periods=3, freq="1min", tz="America/New_York"),
         )
         fake = FakeTicker(ext, intraday_frame(), daily_frame([("2024-01-11", 145.0)]), {"longName": "Test Corp"})
@@ -415,6 +416,30 @@ class TestFetchQuote:
         # Timestamp comes from the same valid bar as the price.
         assert "15:58" in quote.timestamp_label
         assert quote.intraday is not None
+
+    @pytest.mark.parametrize(
+        "closes, expected",
+        [
+            ([147.0, np.nan, 148.0], 148.0),
+            ([-1.0, 2.0], 2.0),
+            ([0.0, 2.0], 2.0),
+            ([148.0, -5.0, np.nan, 148.5], 148.5),
+            ([np.inf, 147.0, 148.0], 148.0),
+        ],
+    )
+    def test_mixed_invalid_extended_data_keeps_last_valid_bar(self, closes, expected):
+        ext = pd.DataFrame(
+            {"Close": closes},
+            index=pd.date_range("2024-01-12 15:57", periods=len(closes), freq="1min", tz="America/New_York"),
+        )
+        fake = FakeTicker(ext, intraday_frame(), daily_frame([("2024-01-11", 145.0)]), {"longName": "Test Corp"})
+
+        with patch("bot.yf.Ticker", return_value=fake):
+            quote = fetch_quote("TEST")
+
+        assert quote is not None
+        # The quote is the last chronologically valid positive close.
+        assert quote.latest_price == pytest.approx(expected)
 
     def test_missing_1m_data_even_with_5m_returns_none(self):
         # No stale 5-minute fallback: without 1-minute extended data there is
@@ -440,11 +465,22 @@ class TestFetchQuote:
         with patch("bot.yf.Ticker", return_value=fake):
             assert fetch_quote("ERROR") is None
 
-    def test_regular_chart_fetch_failure_returns_none(self):
-        fake = FakeTicker(extended_frame(), intraday_error=RuntimeError("network down"))
+    def test_regular_chart_fetch_failure_keeps_quote_without_chart(self):
+        # A chart-fetch failure must not invalidate an already valid quote.
+        fake = FakeTicker(
+            extended_frame(),
+            None,
+            daily_frame([("2024-01-11", 145.0)]),
+            {"longName": "Test Corp"},
+            intraday_error=RuntimeError("network down"),
+        )
 
         with patch("bot.yf.Ticker", return_value=fake):
-            assert fetch_quote("ERROR") is None
+            quote = fetch_quote("TEST")
+
+        assert quote is not None
+        assert quote.intraday is None
+        assert quote.latest_price == pytest.approx(148.5)
 
     def test_empty_regular_chart_keeps_quote_without_chart(self):
         fake = FakeTicker(
@@ -589,6 +625,35 @@ class TestPriceCommand:
         assert kwargs["file"] is None
         assert kwargs["embed"].image.url is None
         assert "No regular-hours chart" in kwargs["embed"].footer.text
+        chart_mock.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_chart_api_exception_sends_quote_without_chart(self):
+        # The chart API raises while the extended quote is valid: the embed is
+        # still sent without a file, with the correct quote price and timestamp,
+        # and no misleading generic fetch failure.
+        fake = FakeTicker(
+            extended_frame(),
+            None,
+            daily_frame([("2024-01-11", 145.0)]),
+            {"longName": "Test Corp"},
+            intraday_error=RuntimeError("network down"),
+        )
+        interaction = make_interaction()
+
+        with patch("bot.yf.Ticker", return_value=fake), patch(
+            "bot.generate_chart"
+        ) as chart_mock:
+            await price.callback(interaction, "TEST")
+
+        interaction.followup.send.assert_awaited_once()
+        kwargs = interaction.followup.send.await_args.kwargs
+        assert kwargs["file"] is None
+        assert kwargs["embed"].image.url is None
+        assert "No regular-hours chart" in kwargs["embed"].footer.text
+        assert "Latest: $148.50" in field_value(kwargs["embed"], "Data")
+        assert "16:05" in field_value(kwargs["embed"], "Timestamp")
+        assert "Delayed / latest available" in field_value(kwargs["embed"], "Timestamp")
         chart_mock.assert_not_called()
 
     @pytest.mark.asyncio
