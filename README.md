@@ -206,3 +206,46 @@ python -m pytest test_bot.py -v
 ```
 
 The suite exercises the real `/price` callback, including defer behavior, a single intraday fetch per command, chart/quote consistency, closed-session previous closes, invalid tickers, empty/error data, and chart buffer cleanup on send failure. Command registration is covered with a mocked command tree: global sync, explicit guild sync (copy-before-sync, exactly one guild-scoped sync, no global clear or global sync), invalid `DISCORD_GUILD_ID` handling, and that startup sync runs once rather than on every reconnect. A real `CommandTree` test verifies that the global command registration survives explicit guild mode while the guild copy exists. Automatic registration is covered with mocked ready/join/leave events: every cached server is registered on ready, reconnects do not repeat REST syncs, joined servers register once, a failing server does not block the others and is retried, and global commands are never cleared.
+
+## Deployment
+
+Every push to `main` is deployed automatically by the **Deploy to server** GitHub Actions
+workflow (`.github/workflows/deploy.yml`) onto the server's self-hosted runner
+(`stkbot-server`). No SSH key, GitHub secret, or bot token is required: the runner is the
+deploy host, so the job updates the existing `/home/server/stkbot` clone in place.
+
+On every push to `main` the workflow:
+
+1. Checks out the exact pushed commit (kept **outside** the deploy directory).
+2. In `/home/server/stkbot`: fetches `origin/main`, verifies the pushed SHA exists and
+   is on `origin/main`, and **refuses to deploy if tracked files are dirty** (untracked
+   and ignored files such as `.env` and `.venv` are left untouched).
+3. Checks out the exact SHA as a detached HEAD.
+4. Installs `requirements.txt` into the persistent `/home/server/stkbot/.venv`.
+5. Runs the test suite **before** touching the service (`PYTHONDONTWRITEBYTECODE=1`,
+   pytest cache disabled).
+6. Restarts `stkbot.service` via `systemctl --user`, then verifies the service is active
+   and the clone's HEAD equals the pushed SHA.
+
+Any failure fails the job and leaves diagnostics in the log; secrets and full service
+logs are never printed. The workflow only triggers on pushes to `main` plus manual
+`workflow_dispatch` — pull-request jobs from forks are never executed. The service
+unit and the server's `.env` are never modified.
+
+### Checking deployment status
+
+- **Runner**: repository → **Actions** → **Runners** — `stkbot-server` should be
+  **online** (labels `self-hosted, Linux, X64, stkbot`).
+- **Workflow runs**: **Actions** → **Deploy to server**, or
+  `gh run list -R sinisterchiller/stkbot --limit 5`.
+- **Service** (on the server): `systemctl --user status stkbot.service` and
+  `systemctl --user is-active stkbot.service`.
+- **Deployed commit** (on the server): `git -C /home/server/stkbot rev-parse HEAD`
+  should match the pushed `main` HEAD.
+
+### Local bot vs. server bot
+
+Only one bot process should be connected with the same Discord token at a time. Stop any
+local `python bot.py` run before the server deploys or restarts, otherwise the two
+processes compete for the same Discord session (duplicate gateway connections and
+conflicting command syncs).

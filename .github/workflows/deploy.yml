@@ -1,0 +1,39 @@
+# Deploys every push to main onto the server's self-hosted runner.
+# The runner IS the deploy host, so no SSH key, GitHub secret or bot token is
+# needed: the job updates the existing /home/server/stkbot clone in place.
+# Only trusted triggers: push to main and manual dispatch (never fork PRs).
+name: Deploy to server
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-stkbot
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy main to server
+    runs-on: [self-hosted, Linux, X64, stkbot]
+    steps:
+      # Checkout of the exact pushed commit, kept outside the deploy
+      # directory so the runner never writes into /home/server/stkbot.
+      - name: Checkout pushed commit
+        uses: actions/checkout@v4
+        with:
+          path: gh-checkout
+
+      # Deploy script from the exact commit being deployed: verifies the
+      # commit is on origin/main, refuses dirty tracked files, installs
+      # requirements into the persistent venv, runs tests, restarts
+      # stkbot.service and verifies HEAD equals the pushed SHA.
+      - name: Deploy exact commit and restart stkbot.service
+        env:
+          DEPLOY_SHA: ${{ github.sha }}
+        run: bash gh-checkout/scripts/deploy.sh "$DEPLOY_SHA"
