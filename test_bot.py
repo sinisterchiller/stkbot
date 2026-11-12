@@ -1889,7 +1889,10 @@ class TestHelpCommand:
     @staticmethod
     def make_interaction():
         interaction = MagicMock()
-        interaction.response.send = AsyncMock()
+        # spec=discord.InteractionResponse rejects invented methods such as
+        # response.send, which does not exist in discord.py.
+        interaction.response = MagicMock(spec=discord.InteractionResponse)
+        interaction.response.send_message = AsyncMock()
         interaction.response.defer = AsyncMock()
         interaction.followup.send = AsyncMock()
         return interaction
@@ -1901,17 +1904,27 @@ class TestHelpCommand:
         parts += [f.value for f in embed.fields]
         return " ".join(part for part in parts if part)
 
+    def test_discord_api_has_send_message_not_send(self):
+        """Regression: the real discord.py API the /help callback must target.
+
+        InteractionResponse exposes a callable send_message and no send; a
+        fake built from spec would raise AttributeError for the invented name.
+        """
+        assert callable(discord.InteractionResponse.send_message)
+        assert not hasattr(discord.InteractionResponse, "send")
+
     @pytest.mark.asyncio
-    async def test_help_sends_private_embed_without_defer(self):
+    async def test_help_sends_private_embed_without_defer_or_followup(self):
         interaction = self.make_interaction()
 
         await help.callback(interaction)
 
         interaction.response.defer.assert_not_awaited()
-        interaction.response.send.assert_awaited_once()
-        kwargs = interaction.response.send.await_args.kwargs
+        interaction.response.send_message.assert_awaited_once()
+        kwargs = interaction.response.send_message.await_args.kwargs
         assert kwargs["ephemeral"] is True
         assert kwargs["embed"] is not None
+        interaction.followup.send.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_help_lists_every_command(self):
@@ -1919,7 +1932,7 @@ class TestHelpCommand:
 
         await help.callback(interaction)
 
-        embed = interaction.response.send.await_args.kwargs["embed"]
+        embed = interaction.response.send_message.await_args.kwargs["embed"]
         names = [field.name for field in embed.fields]
         assert "/price <ticker>" in names
         assert "/remind <ticker> <target>" in names
@@ -1932,7 +1945,7 @@ class TestHelpCommand:
 
         await help.callback(interaction)
 
-        text = self.embed_text(interaction.response.send.await_args.kwargs["embed"])
+        text = self.embed_text(interaction.response.send_message.await_args.kwargs["embed"])
         lowered = text.lower()
         # Direction auto-selection, one-shot alerts, 60-second checking.
         assert "above/below" in lowered
@@ -1955,7 +1968,7 @@ class TestHelpCommand:
 
         await help.callback(interaction)
 
-        embed = interaction.response.send.await_args.kwargs["embed"]
+        embed = interaction.response.send_message.await_args.kwargs["embed"]
         lowered = self.embed_text(embed).lower()
         # The guide itself, and reminder confirmations/lists, are private.
         assert "private" in lowered
@@ -1980,7 +1993,7 @@ class TestHelpCommand:
 
         await help.callback(interaction)
 
-        embed = interaction.response.send.await_args.kwargs["embed"]
+        embed = interaction.response.send_message.await_args.kwargs["embed"]
         assert len(embed.fields) <= REMINDER_FIELDS_PER_EMBED
         total = len(embed.title) + len(embed.description)
         total += sum(len(field.name) + len(field.value) for field in embed.fields)

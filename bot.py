@@ -1288,7 +1288,7 @@ async def help(interaction: discord.Interaction):
     The response is ephemeral, so it is visible only to the invoking user and
     can never leak one user's alerts or details to the channel.
     """
-    await interaction.response.send(embed=_build_help_embed(), ephemeral=True)
+    await interaction.response.send_message(embed=_build_help_embed(), ephemeral=True)
 
 
 def main():
