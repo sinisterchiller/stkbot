@@ -1,17 +1,17 @@
 # Discord Stock Price Bot
 
-A single-file Discord bot that responds to `/price <ticker>` with the latest available stock price, daily change versus the previous trading close, and a 1-day 5-minute interval chart.
+A single-file Discord bot that responds to `/price <ticker>` with the latest available stock price from pre-market, regular and after-hours sessions, the daily change versus the previous trading close, and a 1-day 5-minute regular-hours chart.
 
 ## Features
 
 - **Slash command**: `/price NVDA` (case-insensitive, normalized to uppercase)
-- **Latest price**: Most recent valid 5-minute close from Yahoo Finance intraday data
-- **Daily change**: Dollar and percentage change against the latest valid daily close strictly before the intraday session date
+- **Latest price**: Most recent valid 1-minute close from Yahoo Finance 5-day extended-hours (`prepost=True`) data, spanning pre-market, regular and after-hours sessions; labeled as delayed / latest available, never claimed as real-time
+- **Daily change**: Dollar and percentage change against the latest valid daily close strictly before the quote's exchange-local session date (a pre-market quote on a new day uses the previous regular day's close; an after-hours quote on the same day uses the previous day's close)
 - **Closed markets**: Uses a 10-day daily lookback instead of blindly taking the second-to-last row, and falls back to `info.previousClose` when daily history is unavailable
-- **Chart**: 1-day line chart at 5-minute intervals (green = up, red = down) generated in memory as a PNG
+- **Chart**: 1-day regular-hours line chart at 5-minute intervals (green = up, red = down) generated in memory as a PNG. It is a separate fetch from the quote and may differ from the latest pre-/after-hours price; when regular-hours data is unavailable the quote is sent without a chart
 - **Timestamp**: Exchange-local time with timezone label, marked as delayed / latest available
 - **Error handling**: Friendly messages for invalid tickers, empty data, Yahoo Finance failures, and chart/send failures
-- **Non-blocking**: Yahoo Finance history and chart rendering run in an executor, and each command fetches intraday history once
+- **Non-blocking**: Yahoo Finance history (extended quote, regular-hours chart, daily close) and chart rendering all run in an executor
 - **Observable command registration**: the startup log reports whether the slash command sync succeeded, which commands were registered, which servers got a copy, and what to check when it failed
 - **Automatic per-server registration**: every server the bot is in, and every server it joins later, gets its own `/price` registration as soon as the bot is ready — no guild ID or manual step needed
 - **Optional explicit guild**: `DISCORD_GUILD_ID` can still register one server before the gateway connects
@@ -175,24 +175,26 @@ In Discord, type `/price` followed by a ticker symbol:
 The bot responds with an embed showing:
 
 - Company name and ticker
-- Latest price with dollar/percentage change
+- Latest extended-hours price with dollar/percentage change vs the previous trading close
 - Previous trading close for reference
-- Exchange-local data timestamp, labeled as delayed / latest available
-- 1-day 5-minute interval chart as an attachment
+- Exchange-local data timestamp from the quote bar, labeled as delayed / latest available
+- 1-day 5-minute regular-hours chart as an attachment (omitted when regular-hours data is unavailable)
 
 ## How Data Is Selected
 
-1. Fetch intraday history once with `period="1d"`, `interval="5m"`.
-2. Drop unusable rows and reject non-positive prices before computing anything.
-3. Fetch daily history with `period="10d"`, `interval="1d"`.
-4. Choose the latest valid daily close whose date is strictly earlier than the intraday session date (in the exchange timezone). This handles weekends, holidays, and stale same-day rows.
-5. If no valid daily close exists, use a valid `info.previousClose`.
-6. Reuse the same sanitized intraday frame for the displayed price, timestamp, and chart.
+1. Fetch extended-hours history once with `period="5d"`, `interval="1m"`, `prepost=True` (pre-market, regular and after-hours).
+2. Drop unusable rows and reject non-positive prices; the last valid bar in chronological order is the quote price, and its own timestamp is the displayed timestamp.
+3. Fetch regular-hours history with `period="1d"`, `interval="5m"` for the chart. If it is empty, the quote is sent without a chart; it is never used as a fallback for the displayed price.
+4. Fetch daily history with `period="10d"`, `interval="1d"`.
+5. Choose the latest valid daily close whose date is strictly earlier than the quote bar's exchange-local session date. This handles weekends, holidays, and stale same-day rows: a pre-market quote on a new day uses the previous regular day's close, and an after-hours quote on the same day uses the previous day's close.
+6. If no valid daily close exists, use a valid `info.previousClose`.
 
 ## Notes
 
 - Data source: **yfinance** (unofficial Yahoo Finance interface) — quotes may be delayed and availability is not guaranteed. The bot labels data as delayed / latest available and does not claim real-time pricing.
-- Intraday data uses `period="1d"`, `interval="5m"` and is only available during or after a trading session.
+- The displayed price comes from 1-minute extended-hours data (`period="5d"`, `interval="1m"`, `prepost=True`) and covers pre-market, regular and after-hours sessions.
+- The chart is regular-hours only (`period="1d"`, `interval="5m"`) and **may differ from the latest extended-hours quote**; the embed footer says so. The chart endpoint is not the same data as the displayed price.
+- When regular-hours data is unavailable, the quote is sent without a chart rather than failing the command.
 - No database, caching, or background jobs — one bot file and one slash command.
 - Never commit your actual `.env` file with the token.
 
@@ -205,7 +207,7 @@ pip install -r requirements.txt
 python -m pytest test_bot.py -v
 ```
 
-The suite exercises the real `/price` callback, including defer behavior, a single intraday fetch per command, chart/quote consistency, closed-session previous closes, invalid tickers, empty/error data, and chart buffer cleanup on send failure. Command registration is covered with a mocked command tree: global sync, explicit guild sync (copy-before-sync, exactly one guild-scoped sync, no global clear or global sync), invalid `DISCORD_GUILD_ID` handling, and that startup sync runs once rather than on every reconnect. A real `CommandTree` test verifies that the global command registration survives explicit guild mode while the guild copy exists. Automatic registration is covered with mocked ready/join/leave events: every cached server is registered on ready, reconnects do not repeat REST syncs, joined servers register once, a failing server does not block the others and is retried, and global commands are never cleared.
+The suite exercises the real `/price` callback, including defer behavior, one fetch per data source (1-minute extended quote, 5-minute regular-hours chart, daily close), quote/chart source consistency (the embed price and timestamp come from the extended bar while the chart shows the regular-hours frame), chartless quotes when regular-hours data is missing, no stale 5-minute fallback when 1-minute data is missing, closed-session and pre-market previous closes, invalid tickers, empty/error data, and chart buffer cleanup on send failure. Command registration is covered with a mocked command tree: global sync, explicit guild sync (copy-before-sync, exactly one guild-scoped sync, no global clear or global sync), invalid `DISCORD_GUILD_ID` handling, and that startup sync runs once rather than on every reconnect. A real `CommandTree` test verifies that the global command registration survives explicit guild mode while the guild copy exists. Automatic registration is covered with mocked ready/join/leave events: every cached server is registered on ready, reconnects do not repeat REST syncs, joined servers register once, a failing server does not block the others and is retried, and global commands are never cleared.
 
 ## Deployment
 

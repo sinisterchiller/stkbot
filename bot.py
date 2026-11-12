@@ -24,6 +24,8 @@ load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 
+EXTENDED_PERIOD = "5d"
+EXTENDED_INTERVAL = "1m"
 INTRADAY_PERIOD = "1d"
 INTRADAY_INTERVAL = "5m"
 DAILY_PERIOD = "10d"
@@ -273,7 +275,7 @@ class StockQuote:
     change: float
     change_pct: float
     timestamp_label: str
-    intraday: pd.DataFrame
+    intraday: Optional[pd.DataFrame]
 
 
 def _positive_finite(value) -> Optional[float]:
@@ -386,14 +388,25 @@ def _format_timestamp(ts, display_tz: Optional[tzinfo]) -> str:
 
 def fetch_quote(ticker: str) -> Optional[StockQuote]:
     """
-    Fetch and sanitize one intraday history response for a ticker.
+    Fetch the latest valid 1-minute extended-hours bar for a ticker.
 
-    The same returned frame is used for the displayed price, timestamp and
-    chart. Daily history is only used to find the previous trading close, with
+    The displayed price and timestamp come from a separate 5-day/1-minute
+    ``prepost=True`` fetch that spans pre-market, regular and after-hours
+    sessions; the chosen bar is the last chronologically sorted bar with a
+    finite positive close, and its own timestamp is the quote timestamp. The
+    1-day/5-minute regular-hours frame is fetched only for the chart and may
+    be empty, in which case the quote is returned without a chart. Daily
+    history is only used to find the previous trading close, with
     ``info.previousClose`` as a fallback.
     """
     try:
         ticker_client = yf.Ticker(ticker)
+        extended_hist = ticker_client.history(
+            period=EXTENDED_PERIOD,
+            interval=EXTENDED_INTERVAL,
+            prepost=True,
+            auto_adjust=False,
+        )
         intraday_hist = ticker_client.history(
             period=INTRADAY_PERIOD,
             interval=INTRADAY_INTERVAL,
@@ -402,16 +415,16 @@ def fetch_quote(ticker: str) -> Optional[StockQuote]:
     except Exception:
         return None
 
-    intraday = _sanitize_intraday(intraday_hist)
-    if intraday is None:
+    extended = _sanitize_intraday(extended_hist)
+    if extended is None:
         return None
 
-    latest_price = _positive_finite(intraday["Close"].iloc[-1])
+    latest_price = _positive_finite(extended["Close"].iloc[-1])
     if latest_price is None:
         return None
 
     info = _safe_info(ticker_client)
-    latest_ts = intraday.index[-1]
+    latest_ts = extended.index[-1]
     exchange_tz = _exchange_timezone(info)
 
     if getattr(latest_ts, "tzinfo", None) is not None:
@@ -444,7 +457,7 @@ def fetch_quote(ticker: str) -> Optional[StockQuote]:
         change=change,
         change_pct=change_pct,
         timestamp_label=_format_timestamp(latest_ts, display_tz),
-        intraday=intraday,
+        intraday=_sanitize_intraday(intraday_hist),
     )
 
 
@@ -459,7 +472,7 @@ def generate_chart(
     try:
         color = "#1a9850" if change_pct >= 0 else "#d73027"
         ax.plot(intraday.index, intraday["Close"], color=color, linewidth=1.5)
-        ax.set_title(f"{ticker} — 1D · 5-min intervals", fontsize=12, fontweight="bold")
+        ax.set_title(f"{ticker} — 1D · 5-min · regular hours", fontsize=12, fontweight="bold")
         ax.set_xlabel("Time", fontsize=10)
         ax.set_ylabel("Price", fontsize=10)
         ax.grid(True, alpha=0.3)
@@ -489,7 +502,7 @@ def _build_embed(quote: StockQuote) -> discord.Embed:
         value=(
             f"Latest: ${quote.latest_price:.2f}\n"
             f"Previous Close: ${quote.previous_close:.2f}\n"
-            f"Change: {change_str}"
+            f"Change vs prev close: {change_str}"
         ),
         inline=True,
     )
@@ -498,9 +511,17 @@ def _build_embed(quote: StockQuote) -> discord.Embed:
         value=f"{quote.timestamp_label}\n*Delayed / latest available*",
         inline=True,
     )
-    embed.set_footer(
-        text="1D · 5-minute intervals · Regular market hours · Not real-time"
-    )
+    if quote.intraday is not None:
+        embed.set_footer(
+            text=(
+                "Quote: 5d · 1-minute extended hours · Chart: 1D · 5-min · "
+                "regular hours · chart may differ from latest quote · Not real-time"
+            )
+        )
+    else:
+        embed.set_footer(
+            text="Quote: 5d · 1-minute extended hours · No regular-hours chart available · Not real-time"
+        )
     return embed
 
 
@@ -530,7 +551,10 @@ async def on_guild_remove(guild):
     bot.forget_guild(guild.id)
 
 
-@bot.tree.command(name="price", description="Get latest stock price with 1D 5-min chart")
+@bot.tree.command(
+    name="price",
+    description="Get latest stock price (extended hours) with 1D 5-min regular-hours chart",
+)
 @app_commands.describe(ticker="Stock ticker symbol (e.g., NVDA)")
 async def price(interaction: discord.Interaction, ticker: str):
     """Slash command to fetch and display stock price with chart."""
@@ -558,13 +582,14 @@ async def price(interaction: discord.Interaction, ticker: str):
     chart_buffer: Optional[BytesIO] = None
     chart_file: Optional[discord.File] = None
     try:
-        chart_buffer = await loop.run_in_executor(
-            None, generate_chart, quote.ticker, quote.intraday, quote.change_pct
-        )
-        filename = f"{quote.ticker}_chart.png"
         embed = _build_embed(quote)
-        embed.set_image(url=f"attachment://{filename}")
-        chart_file = discord.File(chart_buffer, filename=filename)
+        if quote.intraday is not None:
+            chart_buffer = await loop.run_in_executor(
+                None, generate_chart, quote.ticker, quote.intraday, quote.change_pct
+            )
+            filename = f"{quote.ticker}_chart.png"
+            embed.set_image(url=f"attachment://{filename}")
+            chart_file = discord.File(chart_buffer, filename=filename)
         await interaction.followup.send(embed=embed, file=chart_file)
     except Exception:
         try:
