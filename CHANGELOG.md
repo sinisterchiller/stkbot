@@ -36,30 +36,33 @@ previous `main` commit `c68ab9d`; the baseline behavior that already existed on
   at the bin edge.
 - **Weekend and holiday handling.** A valid weekend quote charts that quote
   bar's own session date (including weekend bars when Yahoo returns them)
-  rather than substituting an earlier weekday. When the requested date has no
-  new bars, the latest available bar is already the last session with data, so
-  its date is charted; a Saturday request whose newest data is Friday's session
-  charts Friday.
-- **Chartless graceful degradation.** The chart is optional. If aggregation,
-  rendering or the chart attachment fails, the embed is still sent with the
-  quote and without an image instead of failing the command. A chart-fetch
-  problem cannot invalidate a quote that was already selected.
+  rather than substituting an earlier weekday. When no newer bars exist, the
+  latest quote bar is itself the last available bar, so its own session date is
+  charted; if a weekend's newest data is Friday's session, Friday is charted.
+- **Chart aggregated from the quote fetch.** No separate chart request is
+  made, so a chart problem cannot invalidate a quote that was already
+  selected. When aggregation fails, the quote is sent without an image.
+  Rendering and the Discord attachment/send happen after the quote is ready;
+  when either fails, the command replies with a friendly ephemeral "could not
+  build or send the chart" message instead of sending the quote alone.
 - **Explicit delayed-data labeling.** The embed footer now names the quote
   source (`5d · 1-minute extended hours`), the chart derivation (same-session
   5-minute bins, pre-market → after-hours), and the delayed / not-guaranteed-
   real-time disclaimer; the chartless footer says no chart is available. The
   embed field is labeled `Change vs prev close`, and the slash-command
   description mentions extended hours.
-- **Expanded tests.** The suite grew from 49 test functions on `main` to 63
-  test functions (96 test cases including parameterization) on `dev`. New
-  coverage includes extended quote vs. chart separation, pre-market and
-  after-hours previous closes, invalid trailing/mixed/entirely-invalid bar
-  handling, 5-minute bin aggregation, full pre-market→after-hours chart
-  coverage, weekend charting (with a Friday-only fallback), chartless quotes,
-  chart aggregation failures, missing 1-minute data without a stale fallback,
-  rendered pixel checks for the dark background and green/red/gray segments, a
-  net-positive day with falling segments, a single-point chart, and that
-  importing/rendering does not mutate global matplotlib style.
+- **Expanded tests.** The suite grew from 47 test functions on the previous
+  `main` baseline to 61 test functions (96 collected test cases including
+  parameterization) on `dev`. New coverage includes extended quote vs. chart
+  separation, pre-market and after-hours previous closes, invalid
+  trailing/mixed/entirely-invalid bar handling, 5-minute bin aggregation, full
+  pre-market→after-hours chart coverage, weekend charting (including a weekend
+  whose newest bars are Friday's), chartless quotes, chart aggregation
+  failures, friendly ephemeral chart render/send failures, missing 1-minute
+  data without a stale fallback, rendered pixel checks for the dark background
+  and green/red/gray segments, a net-positive day with falling segments, a
+  single-point chart, and that importing/rendering does not mutate global
+  matplotlib style.
 
 ### Changed
 
@@ -86,8 +89,10 @@ previous `main` commit `c68ab9d`; the baseline behavior that already existed on
 
 ### Fixed
 
-- A chart endpoint failure, empty frame or malformed frame no longer discards a
-  valid quote; the quote is sent without a chart instead.
+- The separate 1-day/5-minute chart request was eliminated: the chart is now
+  aggregated from the same extended-hours frame as the quote, so there is no
+  chart request left whose failure could discard a valid quote. If aggregation
+  fails, the quote is still sent, without an image.
 - Invalid trailing rows (NaN/zero/negative) no longer cause the command to
   report missing data when an earlier valid 1-minute bar exists.
 - A net-positive trading day can now show red falling segments (and vice versa)
