@@ -10,3 +10,9 @@ __pycache__/
 *.py[cod]
 *$py.class
 .pytest_cache/
+
+# SQLite reminders database (including WAL/journal variants)
+reminders.db
+reminders.db-wal
+reminders.db-shm
+reminders.db-journal
