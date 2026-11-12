@@ -7,8 +7,8 @@ releases; this file records what changed on `dev` before it was merged into
 ## Unreleased — `dev-feature-price-alerts` merged into `main` (2026-11-11)
 
 This merge brings one-shot stock price alerts and a private `/help` guide
-from `dev-feature-price-alerts` (`7fe6d80..7f1af9c`) onto `main`. Everything
-below is a change relative to the previous `main` commit `7fe6d80`; the
+from `dev-feature-price-alerts` (`723000d..45be3ca`) onto `main`. Everything
+below is a change relative to the previous `main` commit `723000d`; the
 baseline behavior that already existed on `main` is listed separately at
 the end.
 
@@ -89,6 +89,19 @@ the end.
   shutting the client down.
 - `.gitignore` now ignores `reminders.db` plus its `-wal`, `-shm` and
   `-journal` side files.
+- **`reminders.db` file-permission hardening.** Every `ReminderStore`
+  connection now tightens the database file to owner-only `0600` before it
+  is opened — creating an empty file with that mode when no database exists
+  yet, and chmod-ing an existing file in place without touching its
+  contents — so the file is never left world-readable (mode `0644` under
+  the default umask `022`). Any `-wal`, `-shm` or `-journal` sidecar files
+  present on disk are re-tightened to `0600` on every open; a symlinked
+  database path fails loudly instead of being followed, and a database file
+  that cannot be chmod-ed (for example one owned by another user) raises
+  instead of continuing. A pre-existing world-readable database is
+  upgraded on the first store open, with no data loss. The hardening is
+  applied on POSIX platforms only, where the mode bits map to real
+  permissions.
 - `README.md` documents the new commands, alert persistence, batching
   limits and the expanded test coverage.
 
@@ -131,7 +144,7 @@ the end.
 
 ### Baseline already on `main` before this merge
 
-These behaviors existed at `7fe6d80` and are not part of this merge's changes:
+These behaviors existed at `723000d` and are not part of this merge's changes:
 
 - The `/price` slash command with its extended-hours quote, previous-close
   selection, dark per-segment 5-minute chart and chartless-quote degradation.
