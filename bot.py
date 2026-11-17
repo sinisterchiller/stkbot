@@ -1063,9 +1063,14 @@ async def check_price_alerts() -> None:
     ticker, and for each due reminder (price >= target for 'above',
     <= target for 'below') sends a message to the original guild channel:
     an owner mention for 'owner' alerts, an @everyone ping for 'everyone'
-    channel alerts. The reminder is deleted only after a successful send;
-    any channel lookup, quote fetch, or send failure retains it for the
-    next cycle. DM channels never receive alerts.
+    channel alerts. Owner alerts are deleted only after a successful send
+    and remain one-shot. Channel alerts keep their row in the database and
+    track a persisted armed bit: they fire only while armed and due, disarm
+    after a successful send, re-arm once the price is back on the opposite
+    side of the target, and stay armed after a failed send so the
+    notification is retried on the next crossing. Any channel lookup, quote
+    fetch, or send failure retains the alert for the next cycle. DM channels
+    never receive alerts.
     """
     pending = await asyncio.to_thread(reminder_store.list_all)
     if not pending:
@@ -1091,9 +1096,19 @@ async def check_price_alerts() -> None:
             due = quote.price >= target
         else:
             due = quote.price <= target
+
+        channel_alert = row["audience"] == "everyone"
         if not due:
+            if channel_alert and not row["armed"]:
+                # The price is back on the opposite side of the target, so
+                # re-arm the channel alert for its next crossing.
+                await asyncio.to_thread(reminder_store.set_armed, row["id"], True)
             # Stale closed-market quotes persist, and a direction set away
             # from the current price never fires on that stale value.
+            continue
+        if channel_alert and not row["armed"]:
+            # A disarmed channel alert is suppressed while the price stays
+            # on the target side; it re-arms once the price crosses back.
             continue
 
         channel = await _resolve_alert_channel(row["channel_id"])
@@ -1116,12 +1131,25 @@ async def check_price_alerts() -> None:
             )
             continue
 
-        deleted = await asyncio.to_thread(reminder_store.delete_by_id_only, row["id"])
-        if not deleted:
-            print(
-                f"WARNING: alert #{row['id']} sent but delete failed; it may be "
-                "re-sent on the next cycle."
+        if channel_alert:
+            # Channel alerts persist: clearing the armed bit (instead of
+            # deleting the row) keeps the alert one-shot per crossing and
+            # makes the disarmed state survive restarts.
+            disarmed = await asyncio.to_thread(
+                reminder_store.set_armed, row["id"], False
             )
+            if not disarmed:
+                print(
+                    f"WARNING: alert #{row['id']} sent but disarm failed; it may be "
+                    "re-sent on the next cycle."
+                )
+        else:
+            deleted = await asyncio.to_thread(reminder_store.delete_by_id_only, row["id"])
+            if not deleted:
+                print(
+                    f"WARNING: alert #{row['id']} sent but delete failed; it may be "
+                    "re-sent on the next cycle."
+                )
 
 
 @tasks.loop(seconds=ALERT_CHECK_SECONDS)

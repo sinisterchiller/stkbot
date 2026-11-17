@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS reminders (
     target_price REAL NOT NULL,
     direction TEXT NOT NULL CHECK (direction IN ('above', 'below')),
     audience TEXT NOT NULL DEFAULT 'owner' CHECK (audience IN ('owner', 'everyone')),
+    armed INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL
 );
 """
@@ -42,6 +43,11 @@ _MIGRATE_ADD_AUDIENCE = (
     "ALTER TABLE reminders ADD COLUMN audience TEXT NOT NULL DEFAULT 'owner' "
     "CHECK (audience IN ('owner', 'everyone'))"
 )
+
+# Databases created before the armed column existed are migrated in place:
+# the bit is added with a NOT NULL 1 (armed) default, so every pre-existing
+# channel alert stays armed and keeps firing until it has notified once.
+_MIGRATE_ADD_ARMED = "ALTER TABLE reminders ADD COLUMN armed INTEGER NOT NULL DEFAULT 1"
 
 # --- helpers ----------------------------------------------------------------
 
@@ -209,12 +215,17 @@ class ReminderStore:
 
         A pre-existing table missing the audience column is migrated in
         place on first open; the 'owner' default preserves the
-        owner-only notification behaviour of every existing alert.
+        owner-only notification behaviour of every existing alert. A table
+        that has audience but predates the armed bit is likewise migrated,
+        arming every existing alert (default 1) so channel alerts still
+        fire until they have notified once.
         """
         conn.execute(_SCHEMA)
         columns = {row[1] for row in conn.execute("PRAGMA table_info(reminders)")}
         if "audience" not in columns:
             conn.execute(_MIGRATE_ADD_AUDIENCE)
+        if "armed" not in columns:
+            conn.execute(_MIGRATE_ADD_ARMED)
         conn.commit()
 
     # -- CRUD ----------------------------------------------------------------
@@ -264,7 +275,7 @@ class ReminderStore:
         try:
             self._ensure_schema(conn)
             rows = conn.execute(
-                "SELECT id, user_id, channel_id, ticker, target_price, direction, audience, created_at "
+                "SELECT id, user_id, channel_id, ticker, target_price, direction, audience, armed, created_at "
                 "FROM reminders WHERE user_id = ? ORDER BY id",
                 (user_id,),
             ).fetchall()
@@ -278,7 +289,7 @@ class ReminderStore:
         try:
             self._ensure_schema(conn)
             rows = conn.execute(
-                "SELECT id, user_id, channel_id, ticker, target_price, direction, audience, created_at "
+                "SELECT id, user_id, channel_id, ticker, target_price, direction, audience, armed, created_at "
                 "FROM reminders ORDER BY id"
             ).fetchall()
             return [_row_to_dict(r) for r in rows]
@@ -291,7 +302,7 @@ class ReminderStore:
         try:
             self._ensure_schema(conn)
             row = conn.execute(
-                "SELECT id, user_id, channel_id, ticker, target_price, direction, audience, created_at "
+                "SELECT id, user_id, channel_id, ticker, target_price, direction, audience, armed, created_at "
                 "FROM reminders WHERE id = ?",
                 (reminder_id,),
             ).fetchone()
@@ -311,6 +322,30 @@ class ReminderStore:
             cursor = conn.execute(
                 "DELETE FROM reminders WHERE id = ? AND user_id = ?",
                 (reminder_id, user_id),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+        finally:
+            conn.close()
+
+    def set_armed(self, reminder_id: int, armed: bool) -> bool:
+        """Set the armed/disarmed bit of a reminder by ID.
+
+        Used by the alert checker for channel ('everyone') alerts, which
+        persist in the database instead of being deleted: the bit is
+        cleared after a successful send and restored once the price falls
+        back to the opposite side of the target. Because the state lives
+        in the database, a disarmed channel alert stays disarmed across
+        bot restarts.
+
+        Returns True when a row was updated, False when the ID is unknown.
+        """
+        conn = self._connect()
+        try:
+            self._ensure_schema(conn)
+            cursor = conn.execute(
+                "UPDATE reminders SET armed = ? WHERE id = ?",
+                (1 if armed else 0, reminder_id),
             )
             conn.commit()
             return cursor.rowcount > 0

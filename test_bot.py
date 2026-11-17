@@ -2300,7 +2300,7 @@ class TestPriceAlertsChecker:
         assert store.get_by_id(good_id) is None  # AAPL notified
 
     @pytest.mark.asyncio
-    async def test_due_channel_alert_pings_everyone_and_deletes(self, tmp_path):
+    async def test_due_channel_alert_pings_everyone_and_disarms(self, tmp_path):
         store = ReminderStore(db_path=tmp_path / "reminders.db")
         reminder_id = store.add_reminder(42, 10, "NVDA", 100.0, "above", "everyone")
         channel = self.make_channel()
@@ -2322,7 +2322,11 @@ class TestPriceAlertsChecker:
         assert mentions.users is False
         assert mentions.roles is False
         assert mentions.replied_user is False
-        assert store.get_by_id(reminder_id) is None
+        # Channel alerts persist: the row stays with its armed bit cleared.
+        row = store.get_by_id(reminder_id)
+        assert row is not None
+        assert row["audience"] == "everyone"
+        assert row["armed"] == 0
 
     @pytest.mark.asyncio
     async def test_failed_send_retains_channel_alert(self, tmp_path, capsys):
@@ -2338,6 +2342,100 @@ class TestPriceAlertsChecker:
         assert store.get_by_id(reminder_id) is not None
         out = capsys.readouterr().out
         assert f"alert #{reminder_id} (NVDA) send failed" in out
+
+    @pytest.mark.asyncio
+    async def test_same_side_cycles_do_not_reping(self, tmp_path):
+        """A disarmed channel alert stays suppressed while the price remains
+        on the target side: one crossing, one ping, no repeats."""
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        reminder_id = store.add_reminder(42, 10, "NVDA", 100.0, "above", "everyone")
+        channel = self.make_channel()
+
+        with patch("bot.reminder_store", store), patch(
+            "bot.yf.Ticker", return_value=FakeTicker(extended_frame(closes=[150.0]), None, None)
+        ), patch.object(bot_module.bot, "get_channel", return_value=channel):
+            await check_price_alerts()  # crossing: pings and disarms
+            await check_price_alerts()  # still above target: suppressed
+            await check_price_alerts()
+
+        assert channel.send.await_count == 1
+        row = store.get_by_id(reminder_id)
+        assert row is not None
+        assert row["armed"] == 0
+
+    @pytest.mark.asyncio
+    async def test_channel_alert_rearms_on_opposite_side_and_pings_again(self, tmp_path):
+        """Opposite-side movement re-arms a disarmed channel alert, and the
+        next threshold crossing pings again."""
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        reminder_id = store.add_reminder(42, 10, "NVDA", 100.0, "above", "everyone")
+        channel = self.make_channel()
+
+        # Prices per cycle: crossing, opposite side, new crossing.
+        prices = [150.0, 95.0, 150.0]
+        tickers = iter(
+            FakeTicker(extended_frame(closes=[price]), None, None) for price in prices
+        )
+
+        with patch("bot.reminder_store", store), patch(
+            "bot.yf.Ticker", side_effect=lambda ticker: next(tickers)
+        ), patch.object(bot_module.bot, "get_channel", return_value=channel):
+            await check_price_alerts()  # crossing: pings and disarms
+            await check_price_alerts()  # below target: re-arms, no ping
+            assert store.get_by_id(reminder_id)["armed"] == 1
+            await check_price_alerts()  # new crossing: pings again
+
+        assert channel.send.await_count == 2
+        row = store.get_by_id(reminder_id)
+        assert row is not None
+        assert row["armed"] == 0
+
+    @pytest.mark.asyncio
+    async def test_failed_send_keeps_channel_alert_armed(self, tmp_path, capsys):
+        """A failed send leaves the channel alert armed, so the notification
+        is retried on the next cycle."""
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        reminder_id = store.add_reminder(42, 10, "NVDA", 100.0, "above", "everyone")
+        channel = self.make_channel(send=AsyncMock(side_effect=RuntimeError("no permission")))
+
+        with patch("bot.reminder_store", store), patch(
+            "bot.yf.Ticker", return_value=FakeTicker(extended_frame(closes=[150.0]), None, None)
+        ), patch.object(bot_module.bot, "get_channel", return_value=channel):
+            await check_price_alerts()
+
+        row = store.get_by_id(reminder_id)
+        assert row is not None
+        assert row["armed"] == 1
+        out = capsys.readouterr().out
+        assert f"alert #{reminder_id} (NVDA) send failed" in out
+
+    @pytest.mark.asyncio
+    async def test_disarmed_channel_alert_survives_restart(self, tmp_path):
+        """The disarmed bit persists in the database, so a restarted bot does
+        not ping a channel alert that already fired."""
+        db_path = tmp_path / "reminders.db"
+        store_before = ReminderStore(db_path=db_path)
+        reminder_id = store_before.add_reminder(42, 10, "NVDA", 100.0, "above", "everyone")
+        channel = self.make_channel()
+
+        with patch("bot.reminder_store", store_before), patch(
+            "bot.yf.Ticker", return_value=FakeTicker(extended_frame(closes=[150.0]), None, None)
+        ), patch.object(bot_module.bot, "get_channel", return_value=channel):
+            await check_price_alerts()
+        channel.send.assert_awaited_once()
+
+        # Simulate a bot restart: a fresh store over the same database file.
+        store_after = ReminderStore(db_path=db_path)
+        assert store_after.get_by_id(reminder_id)["armed"] == 0
+        channel.reset_mock()
+
+        with patch("bot.reminder_store", store_after), patch(
+            "bot.yf.Ticker", return_value=FakeTicker(extended_frame(closes=[150.0]), None, None)
+        ), patch.object(bot_module.bot, "get_channel", return_value=channel):
+            await check_price_alerts()
+
+        channel.send.assert_not_awaited()
+        assert store_after.get_by_id(reminder_id)["armed"] == 0
 
     @pytest.mark.asyncio
     async def test_channel_alert_audience_survives_restart(self, tmp_path):
@@ -2358,7 +2456,12 @@ class TestPriceAlertsChecker:
         mentions = channel.send.await_args.kwargs["allowed_mentions"]
         assert mentions.everyone is True
         assert mentions.users is False
-        assert store_after.get_by_id(reminder_id) is None
+        # The channel alert persists across the restart with its armed bit
+        # cleared, so it does not ping again on the next crossing.
+        row = store_after.get_by_id(reminder_id)
+        assert row is not None
+        assert row["audience"] == "everyone"
+        assert row["armed"] == 0
 
     @pytest.mark.asyncio
     async def test_failed_send_retains_reminder(self, tmp_path, capsys):

@@ -42,7 +42,10 @@ def test_schema_created(tmp_path):
     finally:
         conn.close()
 
-    expected = {"id", "user_id", "channel_id", "ticker", "target_price", "direction", "created_at"}
+    expected = {
+        "id", "user_id", "channel_id", "ticker", "target_price", "direction",
+        "audience", "armed", "created_at",
+    }
     assert expected.issubset(cols)
 
 
@@ -86,6 +89,8 @@ def test_add_stores_all_fields(tmp_path):
     assert row["created_at"] is not None
     # The audience defaults to 'owner', so existing callers are unchanged.
     assert row["audience"] == "owner"
+    # The armed bit defaults to 1, so every new alert starts armed.
+    assert row["armed"] == 1
 
 
 def test_add_stores_everyone_audience(tmp_path):
@@ -218,6 +223,45 @@ def test_list_all_returns_every_pending(tmp_path):
     assert ids == sorted(ids)
 
 
+# -- set_armed (channel alert state) ------------------------------------------
+
+
+def test_set_armed_disarms_and_rearms(tmp_path):
+    """set_armed flips the persisted armed bit in both directions."""
+    store = _make_store(tmp_path)
+    rid = store.add_reminder(1, 2, "NVDA", 100.0, "above", "everyone")
+    assert store.get_by_id(rid)["armed"] == 1
+
+    assert store.set_armed(rid, False) is True
+    row = store.get_by_id(rid)
+    assert row["armed"] == 0
+    # The bit is visible through every listing path.
+    assert store.list_by_user(1)[0]["armed"] == 0
+    assert store.list_all()[0]["armed"] == 0
+
+    assert store.set_armed(rid, True) is True
+    assert store.get_by_id(rid)["armed"] == 1
+
+
+def test_set_armed_state_survives_reopened_store(tmp_path):
+    """A disarmed bit written by one store instance is visible to a new one.
+
+    This is what makes a disarmed channel alert stay disarmed across a bot
+    restart.
+    """
+    store1 = _make_store(tmp_path)
+    rid = store1.add_reminder(1, 2, "NVDA", 100.0, "above", "everyone")
+    store1.set_armed(rid, False)
+
+    store2 = _make_store(tmp_path)
+    assert store2.get_by_id(rid)["armed"] == 0
+
+
+def test_set_armed_unknown_id(tmp_path):
+    store = _make_store(tmp_path)
+    assert store.set_armed(9999, False) is False
+
+
 # -- delete_by_id (owner check) -------------------------------------------------
 
 
@@ -323,10 +367,12 @@ def _create_legacy_db(tmp_path) -> str:
 
 
 def test_legacy_db_migrates_with_owner_default(tmp_path):
-    """A pre-audience database migrates in place on first store open.
+    """A pre-audience database (no audience, no armed) migrates in place.
 
-    The column is added with the 'owner' default, so the existing alert
-    keeps its owner-only notification behaviour and no data is lost.
+    The audience column is added with the 'owner' default, so the existing
+    alert keeps its owner-only notification behaviour, and the armed bit is
+    added with the 1 (armed) default, so the alert stays armed. No data is
+    lost.
     """
     _create_legacy_db(tmp_path)
     store = _make_store(tmp_path)
@@ -337,6 +383,7 @@ def test_legacy_db_migrates_with_owner_default(tmp_path):
     assert rows[0]["target_price"] == 100.0
     assert rows[0]["direction"] == "above"
     assert rows[0]["audience"] == "owner"
+    assert rows[0]["armed"] == 1
 
     db = tmp_path / "reminders.db"
     conn = sqlite3.connect(str(db))
@@ -345,6 +392,65 @@ def test_legacy_db_migrates_with_owner_default(tmp_path):
     finally:
         conn.close()
     assert "audience" in cols
+    assert "armed" in cols
+
+
+_AUDIENCE_SCHEMA = """\
+CREATE TABLE reminders (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    channel_id INTEGER NOT NULL,
+    ticker TEXT NOT NULL,
+    target_price REAL NOT NULL,
+    direction TEXT NOT NULL CHECK (direction IN ('above', 'below')),
+    audience TEXT NOT NULL DEFAULT 'owner' CHECK (audience IN ('owner', 'everyone')),
+    created_at TEXT NOT NULL
+);
+"""
+
+
+def _create_audience_only_db(tmp_path) -> str:
+    """Create a database with the post-audience, pre-armed schema.
+
+    Simulates a deployment running the /remind-in-channel bot: the
+    reminders table has the audience column but not the armed bit, and
+    holds a pending channel alert.
+    """
+    db = tmp_path / "reminders.db"
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.execute(_AUDIENCE_SCHEMA)
+        conn.execute(
+            "INSERT INTO reminders (user_id, channel_id, ticker, target_price, direction, audience, created_at) "
+            "VALUES (1, 2, 'NVDA', 100.0, 'above', 'everyone', '2026-01-01T00:00:00+00:00')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return str(db)
+
+
+def test_audience_only_db_migrates_with_armed_default(tmp_path):
+    """A database that has audience but no armed column migrates in place.
+
+    The bit is added with the 1 (armed) default, so the existing channel
+    alert stays armed and keeps its audience; no data is lost.
+    """
+    _create_audience_only_db(tmp_path)
+    store = _make_store(tmp_path)
+
+    rows = store.list_all()
+    assert len(rows) == 1
+    assert rows[0]["audience"] == "everyone"
+    assert rows[0]["armed"] == 1
+
+    db = tmp_path / "reminders.db"
+    conn = sqlite3.connect(str(db))
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(reminders)")}
+    finally:
+        conn.close()
+    assert "armed" in cols
 
 
 def test_migrated_db_accepts_new_audiences_and_reopens_idempotently(tmp_path):
