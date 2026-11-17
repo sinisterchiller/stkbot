@@ -15,9 +15,10 @@ See [CHANGELOG.md](CHANGELOG.md) for the extended-hours update and release histo
 - **Timestamp**: Exchange-local time with timezone label, marked as delayed / latest available
 - **Error handling**: Friendly messages for invalid tickers, empty data, Yahoo Finance failures, and chart/send failures
 - **Non-blocking**: Yahoo Finance history (extended quote plus daily close) and chart rendering all run in an executor
-- **Observable command registration**: the startup log reports whether the slash command sync succeeded, which commands were registered, which servers got a copy, and what to check when it failed
-- **Automatic per-server registration**: every server the bot is in, and every server it joins later, gets its own `/price` registration as soon as the bot is ready — no guild ID or manual step needed
-- **Optional explicit guild**: `DISCORD_GUILD_ID` can still register one server before the gateway connects
+- **Observable command registration**: the startup log reports whether the global slash command sync succeeded, which commands were registered, which legacy per-server copies were cleared, and what to check when it failed
+- **Single global registration**: every slash command is registered globally once at startup, and that global registration is the only command scope — no guild ID or manual step needed. Global commands can take up to an hour to appear
+- **Automatic cleanup of legacy per-server copies**: every server the bot is in, and every server it joins later, has any leftover per-server command copies cleared once the bot is ready and the global registration has succeeded, so the global registration stays the only scope — no guild ID or manual step needed
+- **Optional explicit guild cleanup**: `DISCORD_GUILD_ID` can additionally clear one server's legacy per-server copy before the gateway connects, when the global sync has succeeded
 - **Price alerts**: `/remind <ticker> <target>` sets a one-shot alert, `/remind-in-channel <ticker> <target>` sets one that pings @everyone in the invoking channel and persists until deleted, `/reminders` lists your pending alerts (private), `/reminders-in-channel` lists this channel's @everyone alerts with their armed status (public), `/unremind <id>` cancels one of yours (private), and `/unremind-in-channel <id>` cancels one of your own channel alerts in the invoking channel (public). A background task checks pending alerts once every 60 seconds: owner alerts notify the owner in the original server channel exactly once and are deleted after firing, and channel alerts ping @everyone in the invoking channel and persist until deleted with `/unremind-in-channel`
 - **Alert persistence**: pending alerts live in a local SQLite database (`reminders.db`, gitignored) beside `reminders.py`, so they survive bot restarts and deploys
 - **Safe alert failures**: an owner alert is deleted only after its notification was sent successfully, and a channel alert is disarmed only after its send succeeds (re-arming when the price crosses back); any channel, quote or send failure keeps the alert for the next cycle
@@ -50,11 +51,11 @@ cp .env.example .env
 | Variable           | Required | Purpose                                                                                        |
 | ------------------ | -------- | ---------------------------------------------------------------------------------------------- |
 | `DISCORD_TOKEN`    | yes      | Bot token from the Developer Portal                                                             |
-| `DISCORD_GUILD_ID` | no       | Optional override: also register `/price` in this one server during startup                     |
+| `DISCORD_GUILD_ID` | no       | Optional override: also clear this one server's legacy per-server command copy during startup    |
 
-Leave `DISCORD_GUILD_ID` unset or empty for the default behaviour: global registration plus automatic
-registration in every server the bot is in. A value that is not a numeric server ID stops the bot at
-startup with a friendly `Configuration error` message.
+Leave `DISCORD_GUILD_ID` unset or empty for the default behaviour: the single global registration
+plus automatic cleanup of legacy per-server copies in every server the bot is in. A value that is
+not a numeric server ID stops the bot at startup with a friendly `Configuration error` message.
 
 ### 3. Install Dependencies
 
@@ -70,17 +71,17 @@ pip install -r requirements.txt
 python bot.py
 ```
 
-The bot registers its slash commands on startup: global registration in `setup_hook` (before the
-gateway connects) and a per-server copy for every server it is in once Discord reports the bot as
-ready. A successful start prints something like:
+The bot registers its slash commands on startup: one global registration in `setup_hook` (before
+the gateway connects) and a cleanup of any legacy per-server copies in every server it is in once
+Discord reports the bot as ready. A successful start prints something like:
 
 ```
 Synced 1 global command(s): price
-Global commands can take up to an hour to appear. Every server the bot is in also receives an instant guild copy once the bot is ready.
+Global commands can take up to an hour to appear. Legacy per-guild command copies are cleared, so the global registration is the only command scope.
 Logged in as StockBot#1234 (ID: 123456789012345678)
-Synced 1 command(s) to guild 123456789012345678 (My Server): price
-Synced 1 command(s) to guild 987654321098765432 (Second Server): price
-Registered slash commands in 2 guild(s): 123456789012345678, 987654321098765432
+Cleared legacy slash command copy in guild 123456789012345678 (My Server).
+Cleared legacy slash command copy in guild 987654321098765432 (Second Server).
+Cleared legacy slash command copies in 2 guild(s): 123456789012345678, 987654321098765432
 ```
 
 If a sync fails, the bot still comes online but prints an `ERROR: ... slash command sync failed`
@@ -89,42 +90,50 @@ line with the command names, server ID (when known) and troubleshooting hints. S
 
 ## How `/price` Is Registered
 
-Registration needs no configuration and no server ID:
+Registration is a single global registration and needs no configuration and no server ID:
 
-1. **Startup (`setup_hook`, before the gateway connects)** — commands are registered globally by
-   default. The guild cache does not exist yet at this point, so no per-server work happens here. If
-   `DISCORD_GUILD_ID` is set, that one server is registered here instead for the fastest possible
-   startup there.
-2. **Ready (`on_ready`)** — the first moment Discord has reported the bot's server list. Every
-   server the bot is in that has not been registered yet gets a guild copy: the global commands are
-   copied with `tree.copy_global_to(guild=...)` and pushed with `tree.sync(guild=...)`. A guild copy
-   overrides the global registration, so `/price` is usable right away instead of waiting for global
-   propagation.
-3. **Server join (`on_guild_join`)** — a server the bot is invited to later is registered
-   immediately, using the same copy-then-sync flow.
+1. **Startup (`setup_hook`, before the gateway connects)** — every slash command is registered
+   globally; the global registration is the only command scope. The guild cache does not exist yet at
+   this point, so no per-server work happens here. If `DISCORD_GUILD_ID` is set, that one server's
+   legacy per-server copy is also cleared here before the gateway connects, but only when the
+   global sync has succeeded.
+2. **Ready (`on_ready`)** — the first moment Discord has reported the bot's server list. If the
+   startup global sync failed, it is retried here once per ready until it succeeds (a successful
+   global sync is never repeated). Every server the bot is in that has not been cleared yet gets
+   its leftover per-server command copy deleted: `tree.clear_commands(guild=...)` empties the guild's
+   local command set and `tree.sync(guild=...)` pushes that deletion. The global registration is
+   untouched, so every server relies on it; a cleared server simply waits for the global commands
+   to propagate.
+3. **Server join (`on_guild_join`)** — a server the bot is invited to later has any legacy
+   per-server copy cleared immediately, using the same clear-then-sync flow.
 4. **Server leave (`on_guild_remove`)** — Discord deletes the server's command registrations when the
-   bot leaves, so the bot forgets that server. Inviting the bot back registers it again.
+   bot leaves, so the bot forgets that server. Inviting the bot back clears any surviving copy again.
 
 Details that keep this safe:
 
-- **No repeated REST syncs.** `ready` fires again on reconnects. Servers already registered are
-  skipped, so a reconnect only registers servers that are genuinely missing.
-- **Failures stay per server.** A server the bot cannot register in (missing
+- **Clears are gated on the global registration.** While the global sync has not succeeded, the
+  legacy per-server copies are the only working commands, so no server copy is cleared: a failed
+  global sync leaves every copy in place, the global sync is retried once per ready, and the
+  clears start on the first ready after the global sync has succeeded. A failed explicit guild
+  clear never masks a successful global sync, so the other servers are still cleared on ready.
+- **No repeated REST clears.** `ready` fires again on reconnects. Servers already cleared are
+  skipped, so a reconnect only clears servers that still have a leftover copy.
+- **Failures stay per server.** A server whose copy the bot cannot clear (missing
   `applications.commands` scope, no permission, HTTP error) is logged with its ID and an actionable
-  hint, and is never marked as registered. The remaining servers still sync. That server is retried
-  up to three times with a short delay, then on the next reconnect or restart.
-- **Global registrations are never deleted.** Per-server registration only adds guild copies;
-  `tree.clear_commands` is never called, so servers relying on the global registration keep
-  working.
+  hint, and is never marked as cleared. The remaining servers are still cleared. That server is
+  retried up to three times with a short delay, then on the next reconnect or restart; until the
+  clear succeeds the global registration still works there.
+- **Global registrations are never deleted.** Every clear is guild-scoped:
+  `tree.clear_commands` is only ever called with `guild=...`, and no global clear ever follows, so
+  the global registration keeps working in every server.
 
-The two configuration modes:
+The configuration modes:
 
-- **Unset `DISCORD_GUILD_ID` (default)**: global registration plus automatic per-server registration
-  as described above.
-- **Set `DISCORD_GUILD_ID`**: additionally registers that one server before the gateway connects.
-  Every other server is still registered automatically once the bot is ready. Global command
-  registrations are **left unchanged**. If both a global and a guild registration exist for the same
-  server, Discord uses the guild copy.
+- **Unset `DISCORD_GUILD_ID` (default)**: the single global registration plus automatic cleanup of
+  legacy per-server copies as described above.
+- **Set `DISCORD_GUILD_ID`**: additionally clears that one server's legacy copy before the gateway
+  connects. Every other server is still cleared automatically once the bot is ready. Global command
+  registrations are **left unchanged** in both modes.
 
 ## Slash Command Troubleshooting
 
@@ -142,30 +151,60 @@ The two configuration modes:
    (Developer Portal → **OAuth2** → **URL Generator**). Re-invite with the same settings if unsure;
    without `applications.commands` the bot appears online but has **no** slash commands, and the
    startup log reports a `Forbidden` / missing access error for that server.
-2. **Right server.** Every server the bot is in gets its own registration automatically, so no guild
-   ID is needed. Global commands also appear wherever the bot is. Confirm you are in that server and
-   not looking at a DM.
+2. **Right server.** The single global registration appears in every server the bot is in, so no
+   guild ID is needed. Confirm you are in that server and not looking at a DM.
 3. **Bot and channel permissions.** In the target channel the bot needs **View Channel**, **Send
    Messages**, **Embed Links** and **Attach Files** to answer `/price`. Slash commands can also be
    disabled per server under **Server Settings → Integrations** (manage the bot's commands there).
 4. **Restart the Discord client.** Press `Ctrl+R` (Windows/Linux) or `Cmd+R` (macOS), or fully quit
    and reopen Discord — the client caches its command list.
-5. **Check the startup log.** `Registered slash commands in N guild(s): ...` lists the servers the
-   bot registered. A server missing from that list was retried and failed; the `ERROR` / `WARNING`
-   lines name its ID and what to fix, and it is retried again on the next reconnect or restart. Only
-   the global registration waits for Discord's propagation (usually minutes, up to about an hour).
+5. **Check the startup log.** `Cleared legacy slash command copies in N guild(s): ...` lists the
+   servers whose leftover per-server copies the bot deleted. A server missing from that list was
+   retried and failed; the `ERROR` / `WARNING` lines name its ID and what to fix, and it is retried
+   again on the next reconnect or restart. The command itself comes from the single global
+   registration, which waits for Discord's propagation (usually minutes, up to about an hour).
 6. **Read the failure hints.** A failed sync prints `ERROR: ...` plus hints, including wrong
    token/application, missing invite scope, or slash commands disabled for the bot in that server.
    The token is never printed.
 
 ### Forcing a clean re-registration
 
-- This bot never deletes global commands, and per-server registration only adds guild copies.
-- Restart the bot to register every server it is in again; a server that is still failing is retried
-  on each reconnect (`ready`) or restart.
+- This bot never deletes global commands; it only clears leftover per-server copies, and every clear
+  is guild-scoped.
+- Restart the bot to re-run the global sync and clear every server it is in again; a server whose
+  copy is still failing is retried on each reconnect (`ready`) or restart.
 - If an old or unwanted command must actually be removed, do it deliberately yourself, e.g. under
   **Server Settings → Integrations** for a single server, or with a one-off maintenance script you
   run knowingly. No bot startup path removes app-wide commands.
+
+### Duplicate commands
+
+If the same command appears more than once, the usual cause is a pre-existing per-server
+(guild-scoped) copy of the command from the old registration style, which registered commands
+globally *and* per server: this bot only registers the single global set, so the legacy copy and
+the global registration coexist until the cleanup removes it. The bot clears those legacy copies
+in every server it is in once the bot is ready and after the global sync has succeeded, and
+immediately in any server it joins later; a clear that fails is retried up to three times with a
+short delay, then again on the next reconnect or restart, so a duplicate can remain in a server
+whose copy has not been cleared yet.
+
+If the duplicate persists, check in this order:
+
+- **Cleanup logs.** The startup log prints `Cleared legacy slash command copies in N guild(s): ...`
+  for the servers the bot cleared. A server whose copy it could not clear is logged with its ID
+  and an actionable hint; until that clear succeeds, both the legacy copy and the global
+  registration work in that server, so the duplicate stays there.
+- **Client cache.** Refresh the Discord client (`Ctrl+R` / `Cmd+R`, or fully quit and reopen) —
+  the client caches its command list.
+- **Other processes.** Make sure only one bot process is connected with the same token and no
+  other app is using the same application (for example a local `python bot.py` running at the
+  same time as the server bot) — see
+  [Local bot vs. server bot](#local-bot-vs-server-bot).
+
+One more limit to know: after a server's legacy copy is cleared, the global command can take a
+while to appear in that server, because Discord propagates global registrations over minutes, up
+to about an hour. During that window the command can temporarily appear missing there even
+though it is registered globally — that is a propagation delay, not a lost registration.
 
 ## Usage
 
@@ -247,7 +286,7 @@ pip install -r requirements.txt
 python -m pytest test_bot.py test_reminders.py -v
 ```
 
-The suite exercises the real `/price` callback, including defer behavior, one extended-hours fetch plus one daily lookback and no separate chart fetch, quote/chart consistency (the chart ends at the extended-hours quote timestamp and value), pre-market/regular/after-hours chart coverage, 5-minute bin aggregation, weekend quotes charting their own session (with a Friday-only fallback when no weekend bars exist), chartless quotes when aggregation is unavailable, no stale chart fallback when 1-minute data is missing, closed-session and pre-market previous closes, invalid tickers, empty/error data, and chart buffer cleanup on send failure. Chart tests inspect rendered pixels for a dark background and per-segment green/red/gray colours, including a net-positive day with falling segments. Command registration is covered with a mocked command tree: global sync, explicit guild sync (copy-before-sync, exactly one guild-scoped sync, no global clear or global sync), invalid `DISCORD_GUILD_ID` handling, and that startup sync runs once rather than on every reconnect. A real `CommandTree` test verifies that the global command registration survives explicit guild mode while the guild copy exists. Automatic registration is covered with mocked ready/join/leave events: every cached server is registered on ready, reconnects do not repeat REST syncs, joined servers register once, a failing server does not block the others and is retried, and global commands are never cleared. Price alerts are covered with real mocked slash callbacks and checker cycles against `tmp_path` databases: the lightweight quote helper makes exactly one 5d/1m fetch, `/remind` validation (invalid ticker, non-positive target, DM channel, equal current price, executor threading) and persistence, `/remind-in-channel` public confirmation (public defer, public confirmation with no @everyone ping at setup, private failure follow-ups) and channel-audience persistence (@everyone audience, invoking-channel recording, DM rejection, equal-current-price rejection), `/reminders` owner-only listing with embed chunking and multi-message char-budget batching (250+ alerts) including the @everyone audience display, `/reminders-in-channel` public channel-scoped listing (channel isolation, owner-alert exclusion, armed/disarmed display, public chunking within Discord's limits with no @everyone ping, empty list and DM rejection), `/unremind` owner-only cancellation, `/unremind-in-channel` owner+channel+audience-scoped cancellation (cross-user, cross-channel and owner-alert deletes prevented, public reply with no @everyone ping, DM rejection), and the 60-second cycle (unique-ticker quote fetches, upward/downward/equal triggers, one-time notification, failed fetch/send retention, @everyone mention restrictions for channel alerts, DM and unavailable-channel retention, `get_channel`→`fetch_channel` fallback, audience persistence across a simulated restart, loop started exactly once, ready guard and clean stop on close). `test_reminders.py` covers the SQLite storage layer (schema, validation, user isolation, owner-checked and ID-only deletes, channel-scoped listing and atomic owner+channel+audience deletes for channel alerts, audience persistence, legacy-schema migration with the owner default, and `reminders.db` file-permission hardening: owner-only `0600` on the database and its `-wal`/`-shm`/`-journal` sidecars, symlinked-path rejection, and a database file that cannot be chmod-ed raising instead of continuing).
+The suite exercises the real `/price` callback, including defer behavior, one extended-hours fetch plus one daily lookback and no separate chart fetch, quote/chart consistency (the chart ends at the extended-hours quote timestamp and value), pre-market/regular/after-hours chart coverage, 5-minute bin aggregation, weekend quotes charting their own session (with a Friday-only fallback when no weekend bars exist), chartless quotes when aggregation is unavailable, no stale chart fallback when 1-minute data is missing, closed-session and pre-market previous closes, invalid tickers, empty/error data, and chart buffer cleanup on send failure. Chart tests inspect rendered pixels for a dark background and per-segment green/red/gray colours, including a net-positive day with falling segments. Command registration is covered with a mocked command tree: the global sync (which always runs, even when `DISCORD_GUILD_ID` is set), the explicit guild clear (a guild-scoped `clear_commands` with no copy and no global clear, and one that is skipped while the global sync has failed), a failed global sync that leaves the explicit guild's legacy copy in place, a failed explicit guild clear that does not mask the successful global sync, invalid `DISCORD_GUILD_ID` handling, and that startup sync runs once rather than on every reconnect. A real `CommandTree` test verifies that the global command registration survives a guild clear while the legacy guild copy is emptied. Automatic cleanup is covered with mocked ready/join/leave events: every cached server's legacy copy is cleared on ready after the global sync has succeeded, a failed global sync is retried once per ready and never clears a legacy copy, a successful global sync is never repeated, joined servers are cleared once (and deferred while the global sync has failed), a failing server does not block the others and is retried, and global commands are never cleared. Price alerts are covered with real mocked slash callbacks and checker cycles against `tmp_path` databases: the lightweight quote helper makes exactly one 5d/1m fetch, `/remind` validation (invalid ticker, non-positive target, DM channel, equal current price, executor threading) and persistence, `/remind-in-channel` public confirmation (public defer, public confirmation with no @everyone ping at setup, private failure follow-ups) and channel-audience persistence (@everyone audience, invoking-channel recording, DM rejection, equal-current-price rejection), `/reminders` owner-only listing with embed chunking and multi-message char-budget batching (250+ alerts) including the @everyone audience display, `/reminders-in-channel` public channel-scoped listing (channel isolation, owner-alert exclusion, armed/disarmed display, public chunking within Discord's limits with no @everyone ping, empty list and DM rejection), `/unremind` owner-only cancellation, `/unremind-in-channel` owner+channel+audience-scoped cancellation (cross-user, cross-channel and owner-alert deletes prevented, public reply with no @everyone ping, DM rejection), and the 60-second cycle (unique-ticker quote fetches, upward/downward/equal triggers, one-time notification, failed fetch/send retention, @everyone mention restrictions for channel alerts, DM and unavailable-channel retention, `get_channel`→`fetch_channel` fallback, audience persistence across a simulated restart, loop started exactly once, ready guard and clean stop on close). `test_reminders.py` covers the SQLite storage layer (schema, validation, user isolation, owner-checked and ID-only deletes, channel-scoped listing and atomic owner+channel+audience deletes for channel alerts, audience persistence, legacy-schema migration with the owner default, and `reminders.db` file-permission hardening: owner-only `0600` on the database and its `-wal`/`-shm`/`-journal` sidecars, symlinked-path rejection, and a database file that cannot be chmod-ed raising instead of continuing).
 
 ## Deployment
 

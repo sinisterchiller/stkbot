@@ -967,8 +967,9 @@ class TestCommandRegistration:
         monkeypatch.delenv("DISCORD_GUILD_ID", raising=False)
         tree = self._sync_results([SimpleNamespace(name="price")])
 
-        await sync_commands(tree)
+        synced = await sync_commands(tree)
 
+        assert synced == (True, False)
         tree.sync.assert_awaited_once_with()
         tree.copy_global_to.assert_not_called()
         tree.clear_commands.assert_not_called()
@@ -979,36 +980,41 @@ class TestCommandRegistration:
         assert "ERROR" not in out
 
     @pytest.mark.asyncio
-    async def test_sync_commands_guild_mode_syncs_only_the_guild(
+    async def test_sync_commands_always_syncs_globally_and_clears_explicit_guild(
         self, monkeypatch, capsys
     ):
+        # Global registration is the only command scope: the global sync
+        # always runs, and the explicit guild's legacy copy is cleared.
         guild_id = 123456789012345678
         monkeypatch.setenv("DISCORD_GUILD_ID", str(guild_id))
-        tree = self._sync_results([SimpleNamespace(name="price")])
+        # Two sync calls: the global sync first, then the guild clear sync.
+        tree = self._sync_results(
+            [SimpleNamespace(name="price")], [SimpleNamespace(name="price")]
+        )
 
-        await sync_commands(tree)
+        synced = await sync_commands(tree)
 
-        tree.copy_global_to.assert_called_once()
-        assert tree.copy_global_to.call_args.kwargs["guild"].id == guild_id
-
+        assert synced == (True, True)
         sync_calls = tree.sync.await_args_list
-        assert len(sync_calls) == 1
-        assert sync_calls[0].kwargs["guild"].id == guild_id
-        tree.clear_commands.assert_not_called()
+        assert len(sync_calls) == 2
+        assert sync_calls[0].kwargs == {}  # global sync first
+        assert sync_calls[1].kwargs["guild"].id == guild_id
+        tree.clear_commands.assert_called_once_with(guild=discord.Object(id=guild_id))
+        tree.copy_global_to.assert_not_called()
 
         out = capsys.readouterr().out
-        assert f"Synced 1 command(s) to guild {guild_id}: price" in out
-        assert "global command registrations were left unchanged" in out
+        assert "Synced 1 global command(s): price" in out
+        assert f"Cleared legacy slash command copy in guild {guild_id}" in out
         assert "up to an hour" in out
-        assert "registered only in guild" not in out
         assert "ERROR" not in out
 
     @pytest.mark.asyncio
-    async def test_guild_sync_keeps_global_registration_and_adds_guild_command(
+    async def test_guild_clear_keeps_global_registration_and_empties_guild_set(
         self, monkeypatch
     ):
-        # Real CommandTree semantics: global commands must still be registered
-        # after guild mode, and the guild must receive its own copy.
+        # Real CommandTree semantics: the global registration must survive
+        # the startup clear, and the guild's legacy command set must be
+        # emptied instead of receiving a fresh copy.
         client = MagicMock()
         client._connection._command_tree = None
         tree = app_commands.CommandTree(client)
@@ -1018,16 +1024,24 @@ class TestCommandRegistration:
             pass
 
         guild_id = 123456789012345678
+        guild = discord.Object(id=guild_id)
         monkeypatch.setenv("DISCORD_GUILD_ID", str(guild_id))
+        # Simulate a legacy per-guild copy left over from guild registration.
+        tree.copy_global_to(guild=guild)
         tree.sync = AsyncMock(return_value=[SimpleNamespace(name="price")])
 
-        await sync_commands(tree)
+        with patch.object(
+            tree, "clear_commands", wraps=tree.clear_commands
+        ) as clear_mock:
+            synced = await sync_commands(tree)
 
-        guild = discord.Object(id=guild_id)
+        assert synced == (True, True)
+        # The global command survives; the guild's legacy copy is emptied.
         assert [command.name for command in tree.get_commands()] == ["price"]
-        assert [command.name for command in tree.get_commands(guild=guild)] == ["price"]
-        tree.sync.assert_awaited_once()
-        assert tree.sync.await_args.kwargs["guild"].id == guild_id
+        assert [command.name for command in tree.get_commands(guild=guild)] == []
+        # Global sync plus the guild clear sync, with a guild-scoped clear.
+        assert tree.sync.await_count == 2
+        clear_mock.assert_called_once_with(guild=guild)
 
     @pytest.mark.asyncio
     async def test_global_sync_failure_logs_hints_and_does_not_raise(
@@ -1037,36 +1051,74 @@ class TestCommandRegistration:
         tree = MagicMock()
         tree.sync = AsyncMock(side_effect=RuntimeError("boom"))
 
-        await sync_commands(tree)
+        synced = await sync_commands(tree)
 
+        assert synced == (False, False)
         out = capsys.readouterr().out
         assert "ERROR: global slash command sync failed: boom" in out
         assert "applications.commands" in out
         assert "Ctrl/Cmd+R" in out
 
     @pytest.mark.asyncio
-    async def test_guild_sync_failure_logs_guild_id_and_leaves_globals_alone(
+    async def test_failed_global_sync_does_not_clear_explicit_guild(
         self, monkeypatch, capsys
     ):
+        # A failed global sync is never reported as a successful startup, and
+        # the explicit guild's legacy copy is left in place: while the global
+        # registration is missing, the legacy copy is the only working
+        # command set in that server, so clearing it would take /price
+        # offline there.
+        guild_id = 123456789012345678
+        monkeypatch.setenv("DISCORD_GUILD_ID", str(guild_id))
+
+        def sync_side_effect(*, guild=None):
+            if guild is None:
+                raise RuntimeError("boom")
+            return [SimpleNamespace(name="price")]
+
+        tree = MagicMock()
+        tree.sync = AsyncMock(side_effect=sync_side_effect)
+
+        synced = await sync_commands(tree)
+
+        assert synced == (False, False)
+        tree.clear_commands.assert_not_called()
+        out = capsys.readouterr().out
+        assert "ERROR: global slash command sync failed: boom" in out
+        assert "applications.commands" in out
+
+    @pytest.mark.asyncio
+    async def test_failed_guild_clear_is_reported_even_when_global_sync_succeeds(
+        self, monkeypatch, capsys
+    ):
+        # The global sync succeeds, but the uncleared guild copy keeps the
+        # startup from being reported as fully successful.
         guild_id = 123456789012345678
         monkeypatch.setenv("DISCORD_GUILD_ID", str(guild_id))
         forbidden = discord.Forbidden(MagicMock(status=403, reason="Forbidden"), "Missing Access")
+
+        def sync_side_effect(*, guild=None):
+            if guild is None:
+                return [SimpleNamespace(name="price")]
+            raise forbidden
+
         tree = MagicMock()
-        tree.sync = AsyncMock(side_effect=forbidden)
+        tree.sync = AsyncMock(side_effect=sync_side_effect)
 
-        await sync_commands(tree)
+        synced = await sync_commands(tree)
 
-        tree.sync.assert_awaited_once()
-        tree.clear_commands.assert_not_called()
+        assert synced == (True, False)
         out = capsys.readouterr().out
-        assert f"ERROR: slash command sync to guild {guild_id} failed" in out
+        assert "Synced 1 global command(s): price" in out
+        assert f"ERROR: slash command clear for guild {guild_id} failed" in out
+        assert "failed after 1 attempt(s)" in out
         assert "applications.commands" in out
 
     @pytest.mark.asyncio
     async def test_setup_hook_registers_commands_once(self, monkeypatch):
         monkeypatch.delenv("DISCORD_GUILD_ID", raising=False)
         bot_module.bot._price_alerts_started = False
-        with patch("bot.sync_commands", new=AsyncMock(return_value=True)) as sync_mock, patch(
+        with patch("bot.sync_commands", new=AsyncMock(return_value=(True, False))) as sync_mock, patch(
             "bot.price_alerts_loop.start"
         ):
             await bot_module.bot.setup_hook()
@@ -1074,11 +1126,13 @@ class TestCommandRegistration:
         sync_mock.assert_awaited_once_with(bot_module.bot.tree)
 
     @pytest.mark.asyncio
-    async def test_on_ready_with_no_cached_guilds_does_not_sync(self):
+    async def test_on_ready_does_not_repeat_a_successful_global_sync(self):
+        # A successful startup global sync is never repeated on ready, even
+        # with no cached guilds.
         connection = SimpleNamespace(user=SimpleNamespace(id=123456789012345678), guilds=[])
-        with patch.object(bot_module.bot, "_connection", connection), patch.object(
-            bot_module.bot.tree, "sync", new=AsyncMock()
-        ) as sync_mock:
+        with patch.object(bot_module.bot, "_global_synced", True), patch.object(
+            bot_module.bot, "_connection", connection
+        ), patch.object(bot_module.bot.tree, "sync", new=AsyncMock()) as sync_mock:
             await bot_module.on_ready()
 
         sync_mock.assert_not_awaited()
@@ -1120,27 +1174,37 @@ class TestCommandRegistration:
         ]
 
 
-class TestAutomaticGuildSync:
-    """Automatic per-guild registration on ready, join and reconnect."""
+class TestAutomaticGuildCleanup:
+    """Automatic legacy per-guild command cleanup on ready, join and reconnect."""
 
     @pytest.fixture(autouse=True)
-    def reset_sync_state(self, monkeypatch):
+    def reset_clear_state(self, monkeypatch):
         # Retries must not sleep for real in tests, and leftover state from
-        # another test must not hide a guild that still needs syncing.
-        monkeypatch.setattr(bot_module, "GUILD_SYNC_RETRY_DELAY", 0)
+        # another test must not hide a guild that still needs clearing. The
+        # global sync is treated as successful, since these tests exercise
+        # the ready/join/leave clearing paths after a healthy startup.
+        monkeypatch.setattr(bot_module, "GUILD_CLEAR_RETRY_DELAY", 0)
         monkeypatch.delenv("DISCORD_GUILD_ID", raising=False)
-        bot_module.bot._synced_guild_ids.clear()
-        bot_module.bot._syncing_guild_ids.clear()
+        bot_module.bot._cleared_guild_ids.clear()
+        bot_module.bot._clearing_guild_ids.clear()
+        bot_module.bot._global_synced = True
         yield
-        bot_module.bot._synced_guild_ids.clear()
-        bot_module.bot._syncing_guild_ids.clear()
+        bot_module.bot._cleared_guild_ids.clear()
+        bot_module.bot._clearing_guild_ids.clear()
+        bot_module.bot._global_synced = False
 
     @staticmethod
     def make_bot():
-        """A bot with a real command tree holding the same price command."""
+        """A bot with a real command tree holding the same price command.
+
+        The global sync is marked successful, since these tests exercise the
+        ready/join/leave clearing paths after a healthy startup; tests that
+        simulate a failed global sync reset _global_synced themselves.
+        """
         test_bot = bot_module.StockPriceBot(
             command_prefix="!", intents=discord.Intents.default()
         )
+        test_bot._global_synced = True
 
         @test_bot.tree.command(name="price", description="Get latest stock price")
         async def _price(interaction):
@@ -1157,7 +1221,7 @@ class TestAutomaticGuildSync:
         return [SimpleNamespace(name="price")]
 
     @pytest.mark.asyncio
-    async def test_ready_registers_every_cached_guild(self, capsys):
+    async def test_ready_clears_every_cached_guild(self, capsys):
         guilds = [self.guild(111, "Alpha"), self.guild(222, "Beta")]
         connection = SimpleNamespace(user=SimpleNamespace(id=999), guilds=guilds)
 
@@ -1167,18 +1231,20 @@ class TestAutomaticGuildSync:
             await bot_module.on_ready()
 
         assert [call.kwargs["guild"].id for call in sync_mock.await_args_list] == [111, 222]
-        # copy_global_to ran first, so each guild holds its own copy of every
-        # global command.
-        expected = [command.name for command in bot_module.bot.tree.get_commands()]
+        # Every guild copy is emptied while the global registration survives.
+        globals_ = [command.name for command in bot_module.bot.tree.get_commands()]
         for guild in guilds:
-            assert [command.name for command in bot_module.bot.tree.get_commands(guild=guild)] == expected
+            assert [
+                command.name for command in bot_module.bot.tree.get_commands(guild=guild)
+            ] == []
+        assert "price" in globals_
 
         out = capsys.readouterr().out
-        assert "Registered slash commands in 2 guild(s): 111, 222" in out
+        assert "Cleared legacy slash command copies in 2 guild(s): 111, 222" in out
         assert "ERROR" not in out
 
     @pytest.mark.asyncio
-    async def test_reconnect_ready_does_not_repeat_guild_syncs(self, capsys):
+    async def test_reconnect_ready_does_not_repeat_guild_clears(self, capsys):
         guilds = [self.guild(111), self.guild(222)]
         connection = SimpleNamespace(user=SimpleNamespace(id=999), guilds=guilds)
 
@@ -1190,10 +1256,10 @@ class TestAutomaticGuildSync:
 
         assert sync_mock.await_count == 2  # one per guild, none on reconnect
         out = capsys.readouterr().out
-        assert out.count("Registered slash commands in 2 guild(s)") == 1
+        assert out.count("Cleared legacy slash command copies in 2 guild(s)") == 1
 
     @pytest.mark.asyncio
-    async def test_guild_join_registers_the_new_guild_once(self):
+    async def test_guild_join_clears_the_new_guild_once(self):
         guild = self.guild(333, "Gamma")
 
         with patch.object(
@@ -1203,14 +1269,14 @@ class TestAutomaticGuildSync:
             await bot_module.on_guild_join(guild)
 
         assert [call.kwargs["guild"].id for call in sync_mock.await_args_list] == [333]
-        expected = [command.name for command in bot_module.bot.tree.get_commands()]
         assert [
             command.name for command in bot_module.bot.tree.get_commands(guild=guild)
-        ] == expected
-        assert 333 in bot_module.bot._synced_guild_ids
+        ] == []
+        assert "price" in [command.name for command in bot_module.bot.tree.get_commands()]
+        assert 333 in bot_module.bot._cleared_guild_ids
 
     @pytest.mark.asyncio
-    async def test_failed_guild_is_isolated_and_not_marked_synced(
+    async def test_failed_guild_is_isolated_and_not_marked_cleared(
         self, capsys, monkeypatch
     ):
         monkeypatch.setattr(bot_module, "TOKEN", "super-secret-token")
@@ -1227,19 +1293,19 @@ class TestAutomaticGuildSync:
         with patch.object(
             test_bot.tree, "sync", new=AsyncMock(side_effect=sync_side_effect)
         ) as sync_mock:
-            await test_bot.sync_guilds(guilds)
+            await test_bot.clear_guilds(guilds)
 
-        assert 222 in test_bot._synced_guild_ids
-        assert 111 not in test_bot._synced_guild_ids
+        assert 222 in test_bot._cleared_guild_ids
+        assert 111 not in test_bot._cleared_guild_ids
         assert (
             len([call for call in sync_mock.await_args_list if call.kwargs["guild"].id == 111])
-            == bot_module.GUILD_SYNC_ATTEMPTS
+            == bot_module.GUILD_CLEAR_ATTEMPTS
         )
 
         out = capsys.readouterr().out
-        assert "Registered slash commands in 1 guild(s): 222" in out
-        assert "ERROR: slash command sync to guild 111 (Broken) failed" in out
-        assert "WARNING: slash commands are still missing in 1 guild(s): 111" in out
+        assert "Cleared legacy slash command copies in 1 guild(s): 222" in out
+        assert "ERROR: slash command clear for guild 111 (Broken) failed" in out
+        assert "WARNING: legacy slash command copies may remain in 1 guild(s): 111" in out
         assert "applications.commands" in out
         assert "super-secret-token" not in out
 
@@ -1252,13 +1318,13 @@ class TestAutomaticGuildSync:
         with patch.object(
             test_bot.tree, "sync", new=AsyncMock(side_effect=results)
         ) as sync_mock:
-            await test_bot.sync_guilds([guild])
+            await test_bot.clear_guilds([guild])
 
         assert sync_mock.await_count == 2
-        assert 444 in test_bot._synced_guild_ids
+        assert 444 in test_bot._cleared_guild_ids
         out = capsys.readouterr().out
-        assert "Retrying slash command sync to guild 444 in 0s (attempt 2/3)" in out
-        assert "Registered slash commands in 1 guild(s): 444" in out
+        assert "Retrying slash command clear for guild 444 in 0s (attempt 2/3)" in out
+        assert "Cleared legacy slash command copies in 1 guild(s): 444" in out
 
     @pytest.mark.asyncio
     async def test_guild_that_keeps_failing_is_retried_on_the_next_ready_pass(self):
@@ -1266,20 +1332,20 @@ class TestAutomaticGuildSync:
         guild = self.guild(555)
 
         with patch.object(test_bot.tree, "sync", new=AsyncMock(side_effect=RuntimeError("down"))):
-            await test_bot.sync_guilds([guild])
+            await test_bot.clear_guilds([guild])
 
-        assert 555 not in test_bot._synced_guild_ids
+        assert 555 not in test_bot._cleared_guild_ids
 
         with patch.object(
             test_bot.tree, "sync", new=AsyncMock(return_value=self.ok_commands())
         ) as sync_mock:
-            await test_bot.sync_guilds([guild])
+            await test_bot.clear_guilds([guild])
 
         assert sync_mock.await_count == 1
-        assert 555 in test_bot._synced_guild_ids
+        assert 555 in test_bot._cleared_guild_ids
 
     @pytest.mark.asyncio
-    async def test_rejoined_guild_is_registered_again(self):
+    async def test_rejoined_guild_is_cleared_again(self):
         guild = self.guild(666, "Returning")
 
         with patch.object(
@@ -1292,26 +1358,26 @@ class TestAutomaticGuildSync:
         assert sync_mock.await_count == 2
 
     @pytest.mark.asyncio
-    async def test_explicit_guild_id_is_synced_at_startup_and_not_repeated(
+    async def test_explicit_guild_id_is_cleared_at_startup_and_not_repeated(
         self, monkeypatch
     ):
         guild_id = 123456789012345678
         monkeypatch.setenv("DISCORD_GUILD_ID", str(guild_id))
         test_bot = self.make_bot()
 
-        with patch("bot.sync_commands", new=AsyncMock(return_value=True)) as startup_sync:
+        with patch("bot.sync_commands", new=AsyncMock(return_value=(True, True))) as startup_sync:
             await test_bot.setup_hook()
 
         startup_sync.assert_awaited_once_with(test_bot.tree)
-        assert guild_id in test_bot._synced_guild_ids
+        assert guild_id in test_bot._cleared_guild_ids
 
         with patch.object(test_bot.tree, "sync", new=AsyncMock()) as sync_mock:
-            await test_bot.sync_guilds([self.guild(guild_id)])
+            await test_bot.clear_guilds([self.guild(guild_id)])
 
         sync_mock.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_guild_sync_never_clears_global_commands(self):
+    async def test_guild_clear_never_touches_global_commands(self):
         test_bot = self.make_bot()
 
         with patch.object(
@@ -1319,11 +1385,178 @@ class TestAutomaticGuildSync:
         ) as sync_mock, patch.object(
             test_bot.tree, "clear_commands", wraps=test_bot.tree.clear_commands
         ) as clear_mock:
-            await test_bot.sync_guilds([self.guild(777), self.guild(888)])
+            await test_bot.clear_guilds([self.guild(777), self.guild(888)])
 
-        clear_mock.assert_not_called()
+        # Every clear is guild-scoped: no global clear, no copy, and the
+        # global registration survives.
+        assert len(clear_mock.call_args_list) == 2
+        assert all("guild" in call.kwargs for call in clear_mock.call_args_list)
         assert all("guild" in call.kwargs for call in sync_mock.await_args_list)
         assert [command.name for command in test_bot.tree.get_commands()] == ["price"]
+
+    @pytest.mark.asyncio
+    async def test_ready_clear_keeps_global_and_empties_legacy_guild_copy(self):
+        # Real CommandTree semantics: a legacy per-guild copy (as created by
+        # the old copy_global_to flow) must be emptied while the global
+        # registration remains the only command scope.
+        test_bot = self.make_bot()
+        guild = self.guild(999, "Legacy")
+        guild_object = discord.Object(id=guild.id)
+        test_bot.tree.copy_global_to(guild=guild_object)
+        assert [
+            command.name for command in test_bot.tree.get_commands(guild=guild_object)
+        ] == ["price"]
+
+        with patch.object(
+            test_bot.tree, "sync", new=AsyncMock(return_value=self.ok_commands())
+        ):
+            await test_bot.clear_guilds([guild])
+
+        assert [command.name for command in test_bot.tree.get_commands()] == ["price"]
+        assert [
+            command.name for command in test_bot.tree.get_commands(guild=guild_object)
+        ] == []
+        assert 999 in test_bot._cleared_guild_ids
+
+    @pytest.mark.asyncio
+    async def test_failed_global_sync_never_clears_guild_copies(self):
+        # While the global registration is missing, the legacy per-guild
+        # copies are the only working commands, so a failed global sync (at
+        # startup and on the ready retry) must leave every copy in place.
+        bot_module.bot._global_synced = False
+        guild = self.guild(111, "Alpha")
+        guild_object = discord.Object(id=guild.id)
+        bot_module.bot.tree.copy_global_to(guild=guild_object)
+        connection = SimpleNamespace(user=SimpleNamespace(id=999), guilds=[guild])
+
+        with patch.object(bot_module.bot, "_connection", connection), patch.object(
+            bot_module.bot.tree, "sync", new=AsyncMock(side_effect=RuntimeError("boom"))
+        ) as sync_mock, patch.object(
+            bot_module.bot.tree,
+            "clear_commands",
+            wraps=bot_module.bot.tree.clear_commands,
+        ) as clear_mock:
+            await bot_module.on_ready()
+
+        assert bot_module.bot._global_synced is False
+        # One global sync attempt per ready, and no guild-scoped clear.
+        assert [call.kwargs for call in sync_mock.await_args_list] == [{}]
+        clear_mock.assert_not_called()
+        # The legacy copy survives the failed ready pass.
+        globals_ = sorted(
+            command.name for command in bot_module.bot.tree.get_commands()
+        )
+        assert sorted(
+            command.name
+            for command in bot_module.bot.tree.get_commands(guild=guild_object)
+        ) == globals_
+        assert guild.id not in bot_module.bot._cleared_guild_ids
+        # Drop the simulated legacy copy from the shared tree (no REST call).
+        bot_module.bot.tree.clear_commands(guild=guild_object)
+
+    @pytest.mark.asyncio
+    async def test_ready_retries_failed_global_sync_until_it_succeeds(self):
+        # The ready pass retries the failed global sync once per ready; guild
+        # copies are cleared only on the first ready after the global sync
+        # has succeeded, and the successful sync is never repeated.
+        bot_module.bot._global_synced = False
+        guild = self.guild(111, "Alpha")
+        guild_object = discord.Object(id=guild.id)
+        bot_module.bot.tree.copy_global_to(guild=guild_object)
+        connection = SimpleNamespace(user=SimpleNamespace(id=999), guilds=[guild])
+
+        with patch.object(bot_module.bot, "_connection", connection), patch.object(
+            bot_module.bot.tree,
+            "sync",
+            new=AsyncMock(
+                side_effect=[
+                    RuntimeError("boom"),
+                    self.ok_commands(),
+                    self.ok_commands(),
+                ]
+            ),
+        ) as sync_mock:
+            await bot_module.on_ready()  # global retry fails; no clears
+            await bot_module.on_ready()  # global retry succeeds; clear runs
+            await bot_module.on_ready()  # global sync already done; no repeat
+
+        assert bot_module.bot._global_synced is True
+        # ready 1: failed global sync only; ready 2: global sync plus one
+        # guild clear; ready 3: no global sync and no repeated clear.
+        global_syncs = [
+            call for call in sync_mock.await_args_list if "guild" not in call.kwargs
+        ]
+        assert len(global_syncs) == 2
+        guild_syncs = [
+            call for call in sync_mock.await_args_list if "guild" in call.kwargs
+        ]
+        assert [call.kwargs["guild"].id for call in guild_syncs] == [111]
+        assert [
+            command.name
+            for command in bot_module.bot.tree.get_commands(guild=guild_object)
+        ] == []
+        assert 111 in bot_module.bot._cleared_guild_ids
+
+    @pytest.mark.asyncio
+    async def test_failed_explicit_guild_clear_does_not_block_ready_clears(
+        self, monkeypatch
+    ):
+        # The explicit guild's failed clear must not mask the successful
+        # global sync: ready still clears every cached guild, including the
+        # explicit one that was left uncleared at startup.
+        guild_id = 123456789012345678
+        monkeypatch.setenv("DISCORD_GUILD_ID", str(guild_id))
+        guilds = [self.guild(guild_id, "Explicit"), self.guild(222, "Beta")]
+        connection = SimpleNamespace(user=SimpleNamespace(id=999), guilds=guilds)
+
+        with patch("bot.sync_commands", new=AsyncMock(return_value=(True, False))), patch(
+            "bot.price_alerts_loop.start"
+        ):
+            await bot_module.bot.setup_hook()
+
+        assert bot_module.bot._global_synced is True
+        assert guild_id not in bot_module.bot._cleared_guild_ids
+
+        with patch.object(bot_module.bot, "_connection", connection), patch.object(
+            bot_module.bot.tree, "sync", new=AsyncMock(return_value=self.ok_commands())
+        ) as sync_mock:
+            await bot_module.on_ready()
+
+        # Every cached guild, the explicit one included, is cleared on ready.
+        assert [call.kwargs["guild"].id for call in sync_mock.await_args_list] == [
+            guild_id,
+            222,
+        ]
+        assert {guild_id, 222} <= bot_module.bot._cleared_guild_ids
+
+    @pytest.mark.asyncio
+    async def test_guild_join_is_deferred_while_global_sync_has_failed(self):
+        # A join while the global sync has not succeeded clears nothing and
+        # reports no failure: the copy is retried on the next ready pass.
+        bot_module.bot._global_synced = False
+        guild = self.guild(333, "Gamma")
+        guild_object = discord.Object(id=guild.id)
+        bot_module.bot.tree.copy_global_to(guild=guild_object)
+
+        with patch.object(
+            bot_module.bot.tree, "sync", new=AsyncMock()
+        ) as sync_mock, patch.object(
+            bot_module.bot.tree, "clear_commands", wraps=bot_module.bot.tree.clear_commands
+        ) as clear_mock:
+            await bot_module.on_guild_join(guild)
+
+        sync_mock.assert_not_awaited()
+        clear_mock.assert_not_called()
+        assert guild.id not in bot_module.bot._cleared_guild_ids
+        globals_ = sorted(
+            command.name for command in bot_module.bot.tree.get_commands()
+        )
+        assert sorted(
+            command.name
+            for command in bot_module.bot.tree.get_commands(guild=guild_object)
+        ) == globals_
+        # Drop the simulated legacy copy from the shared tree (no REST call).
+        bot_module.bot.tree.clear_commands(guild=guild_object)
 
 
 class TestFetchLatestPrice:
@@ -2838,7 +3071,7 @@ class TestPriceAlertsLoopLifecycle:
     @pytest.mark.asyncio
     async def test_setup_hook_starts_the_loop_only_once(self, monkeypatch):
         monkeypatch.delenv("DISCORD_GUILD_ID", raising=False)
-        with patch("bot.sync_commands", new=AsyncMock(return_value=True)), patch(
+        with patch("bot.sync_commands", new=AsyncMock(return_value=(True, False))), patch(
             "bot.price_alerts_loop.start"
         ) as start_mock:
             await bot_module.bot.setup_hook()

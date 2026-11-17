@@ -108,6 +108,32 @@ one-shot alerts (`/remind`, `/reminders`, `/unremind`, `/help`).
 - `README.md` and `/help` document the new commands, the @everyone
   behaviour and the alert lifecycles.
 
+### Fixed
+
+- **Command registration is now global-only, and legacy per-guild command
+  copies are cleared automatically.** Slash commands are registered in
+  exactly one scope: the global registration in `setup_hook` (the global
+  sync now always runs, regardless of `DISCORD_GUILD_ID`). The old
+  per-server guild copies (created by the previous copy-then-sync flow)
+  are deleted with a guild-scoped `tree.clear_commands(guild=...)` plus
+  `tree.sync(guild=...)` for every cached guild on `ready`, for every
+  guild joined on `on_guild_join`, and — when `DISCORD_GUILD_ID` is set —
+  for that one guild before the gateway connects. Clears are gated on a
+  successful global sync: while the global registration is missing, the
+  legacy per-guild copies are the only working commands, so no copy is
+  cleared (explicit or ready/join) until the global sync succeeds. A
+  failed startup global sync is retried once per `ready` until it
+  succeeds, and a successful global sync is never repeated, so the bot
+  recovers without a process restart. A failed explicit guild clear
+  never masks a successful global sync, so the other guilds are still
+  cleared on `ready`. Clears are retried up to three times with a short
+  delay, then on the next reconnect or restart; a failing guild never
+  blocks the others, and the global registration is never touched.
+  Global commands can take up to an hour to appear, so the README no
+  longer promises instant command availability in every server, and its
+  troubleshooting notes now point at a client refresh or other bot
+  instances/clients when the same command appears more than once.
+
 ## Unreleased — `dev-feature-price-alerts` merged into `main` (2026-11-11)
 
 This merge brings one-shot stock price alerts and a private `/help` guide

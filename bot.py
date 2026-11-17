@@ -62,15 +62,15 @@ SYNC_TROUBLESHOOTING = (
     "  - Confirm DISCORD_TOKEN belongs to the application you invited.\n"
     "  - Confirm the bot is a member of the target server and that slash commands "
     "are enabled for it there (Server Settings -> Integrations).\n"
-    "  - Guild commands appear instantly; global commands can take up to an hour "
-    "to appear. The bot never deletes existing global registrations.\n"
+    "  - Global commands can take up to an hour to appear. The bot never deletes "
+    "existing global registrations.\n"
     "  - Restart your Discord client (Ctrl/Cmd+R) and check you are in the right server."
 )
 
-# A guild sync is retried a few times with a fixed delay before the guild is
-# left unsynced for the next ready pass (reconnect or restart) to retry.
-GUILD_SYNC_ATTEMPTS = 3
-GUILD_SYNC_RETRY_DELAY = 5.0
+# A guild clear is retried a few times with a fixed delay before the guild is
+# left uncleared for the next ready pass (reconnect or restart) to retry.
+GUILD_CLEAR_ATTEMPTS = 3
+GUILD_CLEAR_RETRY_DELAY = 5.0
 
 # Seconds between price-alert checks. discord.py does not auto-start ext.tasks
 # loops, so this loop is started exactly once in StockPriceBot.setup_hook.
@@ -129,44 +129,45 @@ def _guild_id_list(guild_ids) -> str:
     return ", ".join(str(guild_id) for guild_id in guild_ids) if guild_ids else "(none)"
 
 
-async def _sync_global_commands(tree: app_commands.CommandTree) -> None:
-    """Register every slash command globally (default registration mode)."""
+async def _sync_global_commands(tree: app_commands.CommandTree) -> bool:
+    """Register every slash command globally (the only registration scope)."""
     try:
         synced = await tree.sync()
     except Exception as exc:
         print(f"ERROR: global slash command sync failed: {exc}")
         print("The bot is online, but /price may be missing or stale in servers.")
         print(SYNC_TROUBLESHOOTING)
-        return
+        return False
     print(f"Synced {len(synced)} global command(s): {_command_names(synced)}")
     print(
-        "Global commands can take up to an hour to appear. Every server the bot "
-        "is in also receives an instant guild copy once the bot is ready."
-    )
-
-
-async def _sync_guild_commands(tree: app_commands.CommandTree, guild) -> bool:
-    """
-    Register every global command in one guild and report whether it worked.
-
-    Failures are logged and returned instead of raised, so a guild the bot
-    cannot register in never stops the remaining guilds from syncing. Existing
-    global registrations are never cleared.
-    """
-    try:
-        tree.copy_global_to(guild=guild)
-        synced = await tree.sync(guild=guild)
-    except Exception as exc:
-        print(f"ERROR: slash command sync to guild {_guild_label(guild)} failed: {exc}")
-        return False
-    print(
-        f"Synced {len(synced)} command(s) to guild {_guild_label(guild)}: "
-        f"{_command_names(synced)}"
+        "Global commands can take up to an hour to appear. Legacy per-guild "
+        "command copies are cleared, so the global registration is the only "
+        "command scope."
     )
     return True
 
 
-async def sync_guild_commands(
+async def _clear_guild_commands(tree: app_commands.CommandTree, guild) -> bool:
+    """
+    Delete one guild's legacy slash command registrations and report success.
+
+    The guild's local command set is emptied with clear_commands(guild=...) and
+    then pushed with sync(guild=...), which deletes the guild's remote
+    registrations; global registrations are never cleared. Failures are logged
+    and returned instead of raised, so a guild that cannot be cleared never
+    stops the remaining guilds from being cleared.
+    """
+    try:
+        tree.clear_commands(guild=guild)
+        await tree.sync(guild=guild)
+    except Exception as exc:
+        print(f"ERROR: slash command clear for guild {_guild_label(guild)} failed: {exc}")
+        return False
+    print(f"Cleared legacy slash command copy in guild {_guild_label(guild)}.")
+    return True
+
+
+async def clear_guild_commands(
     tree: app_commands.CommandTree,
     guild,
     *,
@@ -174,131 +175,148 @@ async def sync_guild_commands(
     retry_delay: Optional[float] = None,
 ) -> bool:
     """
-    Sync commands into one guild, retrying transient failures with a delay.
+    Clear one guild's legacy command copy, retrying transient failures with a delay.
 
-    Retry policy defaults to GUILD_SYNC_ATTEMPTS and GUILD_SYNC_RETRY_DELAY.
-    Only a successful sync counts as registered; a guild that keeps failing is
-    reported as unsynced so a later ready pass retries it.
+    Retry policy defaults to GUILD_CLEAR_ATTEMPTS and GUILD_CLEAR_RETRY_DELAY.
+    Only a successful clear counts as done; a guild that keeps failing is
+    reported as uncleared so a later ready pass retries it.
     """
-    attempts = GUILD_SYNC_ATTEMPTS if attempts is None else attempts
-    retry_delay = GUILD_SYNC_RETRY_DELAY if retry_delay is None else retry_delay
+    attempts = GUILD_CLEAR_ATTEMPTS if attempts is None else attempts
+    retry_delay = GUILD_CLEAR_RETRY_DELAY if retry_delay is None else retry_delay
     for attempt in range(1, attempts + 1):
-        if await _sync_guild_commands(tree, guild):
+        if await _clear_guild_commands(tree, guild):
             return True
         if attempt < attempts:
             print(
-                f"Retrying slash command sync to guild {_guild_label(guild)} in "
+                f"Retrying slash command clear for guild {_guild_label(guild)} in "
                 f"{retry_delay:g}s (attempt {attempt + 1}/{attempts})."
             )
             await asyncio.sleep(retry_delay)
     print(
-        f"ERROR: slash command sync to guild {_guild_label(guild)} failed after "
-        f"{attempts} attempt(s)."
+        f"ERROR: slash command clear for guild {_guild_label(guild)} failed after "
+        f"{attempts} attempt(s); its legacy command copy may remain."
     )
     print(SYNC_TROUBLESHOOTING)
     return False
 
 
-async def sync_commands(tree: app_commands.CommandTree) -> bool:
+async def sync_commands(tree: app_commands.CommandTree) -> tuple[bool, bool]:
     """
     Register slash commands once at startup.
 
-    Global registration stays the default. An explicit DISCORD_GUILD_ID keeps
-    the previous behaviour of registering that one guild before the gateway
-    connects; every guild is still registered automatically once ready.
-    Returns True when the attempted startup registration succeeded.
+    Global registration is the only command scope, so the global sync always
+    happens, regardless of DISCORD_GUILD_ID. When DISCORD_GUILD_ID is set,
+    that guild's legacy per-guild command copy is cleared before the gateway
+    connects, but only after the global sync has succeeded: while the global
+    registration is missing, the legacy copies are the only working
+    commands. Every other guild is cleared automatically once ready.
+    Returns (global_synced, guild_cleared) so a failed global sync is never
+    reported as a successful startup and a failed guild clear never masks
+    global success.
     """
+    global_synced = await _sync_global_commands(tree)
     guild_id = get_guild_id()
-    if guild_id is None:
-        await _sync_global_commands(tree)
-        return True
-    synced = await sync_guild_commands(tree, discord.Object(id=guild_id), attempts=1)
-
-    # The explicit guild sync only shortens the wait for one server. Global
-    # registrations are intentionally left untouched so installed servers keep
-    # working; deleting them here would break every other server.
-    print(
-        "Existing global command registrations were left unchanged; they can "
-        "take up to an hour to appear in other servers."
+    if not global_synced or guild_id is None:
+        return global_synced, False
+    guild_cleared = await clear_guild_commands(
+        tree, discord.Object(id=guild_id), attempts=1
     )
-    return synced
+    if global_synced and guild_cleared:
+        print(
+            "The explicit guild's legacy command copy was cleared; global "
+            "commands are the only registration scope and can take up to an "
+            "hour to appear."
+        )
+    return global_synced, guild_cleared
 
 
 class StockPriceBot(commands.Bot):
-    """Bot that registers slash commands globally and in every guild it is in."""
+    """Bot that registers slash commands globally and clears legacy per-guild copies."""
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self._synced_guild_ids: set[int] = set()
-        self._syncing_guild_ids: set[int] = set()
-        self._guild_sync_lock = asyncio.Lock()
+        self._cleared_guild_ids: set[int] = set()
+        self._clearing_guild_ids: set[int] = set()
+        self._guild_clear_lock = asyncio.Lock()
+        self._global_synced = False
         self._price_alerts_started = False
 
     async def setup_hook(self) -> None:
         guild_id = get_guild_id()
-        if await sync_commands(self.tree) and guild_id is not None:
-            self._synced_guild_ids.add(guild_id)
+        global_synced, guild_cleared = await sync_commands(self.tree)
+        # Track the global sync result separately from the combined startup
+        # result: a failed explicit guild clear must not mask a successful
+        # global sync, because ready-time clears depend on it.
+        self._global_synced = global_synced
+        if global_synced and guild_cleared and guild_id is not None:
+            self._cleared_guild_ids.add(guild_id)
         # setup_hook runs once per process (reconnects only fire on_ready),
         # so this guard keeps the alert loop from ever being started twice.
         if not self._price_alerts_started:
             self._price_alerts_started = True
             price_alerts_loop.start()
 
-    async def sync_guild(self, guild) -> bool:
+    async def clear_guild(self, guild) -> bool:
         """
-        Register commands in one guild at most once per membership.
+        Clear a guild's legacy command copy at most once per membership.
 
-        Returns True when the guild is registered or another task is already
-        registering it, and False when the sync failed. A failed guild is not
-        recorded, so a later ready pass retries it.
+        Clearing is gated on a successful global sync: while the global
+        registration is missing, the legacy per-guild copies are the only
+        working commands, so they are left in place until the global sync
+        succeeds. Returns True when the guild is cleared, another task is
+        already clearing it, or the clear is deferred because the global
+        sync has not succeeded yet, and False when the clear failed. A
+        failed guild is not recorded, so a later ready pass retries it.
         """
-        async with self._guild_sync_lock:
+        if not self._global_synced:
+            return True
+        async with self._guild_clear_lock:
             if (
-                guild.id in self._synced_guild_ids
-                or guild.id in self._syncing_guild_ids
+                guild.id in self._cleared_guild_ids
+                or guild.id in self._clearing_guild_ids
             ):
                 return True
-            self._syncing_guild_ids.add(guild.id)
+            self._clearing_guild_ids.add(guild.id)
 
-        synced = False
+        cleared = False
         try:
-            synced = await sync_guild_commands(self.tree, guild)
-            return synced
+            cleared = await clear_guild_commands(self.tree, guild)
+            return cleared
         finally:
-            async with self._guild_sync_lock:
-                self._syncing_guild_ids.discard(guild.id)
-                if synced:
-                    self._synced_guild_ids.add(guild.id)
+            async with self._guild_clear_lock:
+                self._clearing_guild_ids.discard(guild.id)
+                if cleared:
+                    self._cleared_guild_ids.add(guild.id)
 
-    async def sync_guilds(self, guilds) -> None:
+    async def clear_guilds(self, guilds) -> None:
         """
-        Register commands in every guild that is not registered yet.
+        Clear legacy command copies in every guild that is not cleared yet.
 
         Ready fires again after a reconnect and guild joins can race with it;
-        already registered guilds are skipped, so no REST sync is repeated.
+        already cleared guilds are skipped, so no REST clear is repeated.
         """
-        before = set(self._synced_guild_ids)
+        before = set(self._cleared_guild_ids)
         failed: list[int] = []
         for guild in guilds:
-            if not await self.sync_guild(guild):
+            if not await self.clear_guild(guild):
                 failed.append(guild.id)
 
-        registered = sorted(self._synced_guild_ids - before)
-        if registered:
+        cleared = sorted(self._cleared_guild_ids - before)
+        if cleared:
             print(
-                f"Registered slash commands in {len(registered)} guild(s): "
-                f"{_guild_id_list(registered)}"
+                f"Cleared legacy slash command copies in {len(cleared)} guild(s): "
+                f"{_guild_id_list(cleared)}"
             )
         if failed:
             print(
-                f"WARNING: slash commands are still missing in {len(failed)} "
+                f"WARNING: legacy slash command copies may remain in {len(failed)} "
                 f"guild(s): {_guild_id_list(failed)}. They will be retried on the "
                 "next gateway reconnect or bot restart."
             )
 
     def forget_guild(self, guild_id: int) -> None:
-        """Drop sync state so rejoining the guild registers commands again."""
-        self._synced_guild_ids.discard(guild_id)
+        """Drop clear state so rejoining the guild clears its command copy again."""
+        self._cleared_guild_ids.discard(guild_id)
 
     async def close(self) -> None:
         """Stop the price-alert loop, then shut the client down.
@@ -785,25 +803,34 @@ def _build_embed(quote: StockQuote) -> discord.Embed:
 async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
     # setup_hook runs before the gateway connects, so this is the first point
-    # where the guild list is cached. Guilds synced in setup_hook are skipped.
-    await bot.sync_guilds(bot.guilds)
+    # where the guild list is cached. If the startup global sync failed, it
+    # is retried here once per ready until it succeeds; a successful global
+    # sync is never repeated, so reconnects stay clean.
+    if not bot._global_synced:
+        bot._global_synced = await _sync_global_commands(bot.tree)
+    # Legacy per-guild copies are only cleared after the global registration
+    # has been confirmed, so a failed global sync never removes the last
+    # working command registrations. Guilds cleared in setup_hook are
+    # skipped.
+    await bot.clear_guilds(bot.guilds)
 
 
 @bot.event
 async def on_guild_join(guild):
-    print(f"Joined guild {_guild_label(guild)}; registering slash commands.")
-    if not await bot.sync_guild(guild):
+    print(f"Joined guild {_guild_label(guild)}; clearing any legacy slash command copy.")
+    if not await bot.clear_guild(guild):
         print(
-            "WARNING: slash commands are not registered in guild "
-            f"{_guild_label(guild)}. They will be retried on the next gateway "
-            "reconnect or bot restart."
+            "WARNING: the legacy slash command copy in guild "
+            f"{_guild_label(guild)} was not cleared. It will be retried on the "
+            "next gateway reconnect or bot restart."
         )
 
 
 @bot.event
 async def on_guild_remove(guild):
     # Discord drops guild command registrations when the bot leaves, so a
-    # rejoin has to register the guild copy again from scratch.
+    # rejoin normally has nothing to clear; dropping the state lets a rejoin
+    # clear a copy if one somehow survives.
     bot.forget_guild(guild.id)
 
 
