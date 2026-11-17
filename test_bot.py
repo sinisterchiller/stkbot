@@ -29,6 +29,7 @@ from bot import (
     price,
     price_alerts_loop,
     remind,
+    remind_in_channel,
     reminders,
     sync_commands,
     unremind,
@@ -1100,10 +1101,18 @@ class TestCommandRegistration:
 
         run_mock.assert_called_once_with("test-token")
 
-    def test_command_tree_registers_all_five_commands(self):
-        # The real bot tree must expose every slash command, including /help.
+    def test_command_tree_registers_all_six_commands(self):
+        # The real bot tree must expose every slash command, including /help
+        # and the hyphenated /remind-in-channel.
         names = sorted(command.name for command in bot_module.bot.tree.get_commands())
-        assert names == ["help", "price", "remind", "reminders", "unremind"]
+        assert names == [
+            "help",
+            "price",
+            "remind",
+            "remind-in-channel",
+            "reminders",
+            "unremind",
+        ]
 
 
 class TestAutomaticGuildSync:
@@ -1529,6 +1538,126 @@ class TestRemindCommand:
         assert len(store.list_by_user(42)) == 1
 
 
+class TestRemindInChannelCommand:
+    """/remind-in-channel: public confirmation without setup ping, channel-audience persistence and validation."""
+
+    @staticmethod
+    def make_interaction(user_id=42, channel_id=10, guild_id=111):
+        interaction = MagicMock()
+        interaction.user = SimpleNamespace(id=user_id)
+        interaction.channel = SimpleNamespace(
+            id=channel_id, guild=SimpleNamespace(id=guild_id) if guild_id is not None else None
+        )
+        interaction.response.defer = AsyncMock()
+        interaction.followup.send = AsyncMock()
+        return interaction
+
+    @staticmethod
+    def ok_fake():
+        return FakeTicker(extended_frame(), None, None)
+
+    @pytest.mark.asyncio
+    async def test_success_saves_everyone_alert_and_confirms_publicly(self, tmp_path):
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        interaction = self.make_interaction()
+
+        with patch("bot.yf.Ticker", return_value=self.ok_fake()), patch(
+            "bot.reminder_store", store
+        ):
+            await remind_in_channel.callback(interaction, " nvda ", 150.0)
+
+        # Public defer: the confirmation must be visible to the whole channel,
+        # and an ephemeral defer can never be made public later.
+        interaction.response.defer.assert_awaited_once_with(thinking=True, ephemeral=False)
+        interaction.followup.send.assert_awaited_once()
+        kwargs = interaction.followup.send.await_args.kwargs
+        assert kwargs["ephemeral"] is False
+
+        rows = store.list_by_user(42)
+        assert len(rows) == 1
+        assert rows[0]["ticker"] == "NVDA"
+        assert rows[0]["target_price"] == 150.0
+        assert rows[0]["direction"] == "above"
+        # The invoking channel is recorded and the audience is 'everyone'.
+        assert rows[0]["channel_id"] == 10
+        assert rows[0]["audience"] == "everyone"
+
+        embed = kwargs["embed"]
+        values = {field.name: field.value for field in embed.fields}
+        assert values["Ticker"] == "NVDA"
+        assert values["Target"] == "$150.00"
+        assert values["Current"] == "$148.50"
+        assert values["Direction"] == "above"
+        assert values["Audience"] == "@everyone in this channel"
+        # The public confirmation must not ping anyone at setup: the
+        # Audience field's literal "@everyone" stays plain text.
+        mentions = kwargs["allowed_mentions"]
+        assert mentions.everyone is False
+        assert mentions.users is False
+        assert mentions.roles is False
+        assert mentions.replied_user is False
+
+    @pytest.mark.asyncio
+    async def test_lower_target_sets_below_direction(self, tmp_path):
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        interaction = self.make_interaction()
+
+        with patch("bot.yf.Ticker", return_value=self.ok_fake()), patch(
+            "bot.reminder_store", store
+        ):
+            await remind_in_channel.callback(interaction, "NVDA", 140.0)
+
+        interaction.followup.send.assert_awaited_once()
+        assert interaction.followup.send.await_args.kwargs["ephemeral"] is False
+        rows = store.list_by_user(42)
+        assert rows[0]["direction"] == "below"
+        assert rows[0]["audience"] == "everyone"
+
+    @pytest.mark.asyncio
+    async def test_target_equal_to_current_price_is_rejected(self, tmp_path):
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        interaction = self.make_interaction()
+
+        with patch("bot.yf.Ticker", return_value=self.ok_fake()), patch(
+            "bot.reminder_store", store
+        ):
+            await remind_in_channel.callback(interaction, "NVDA", 148.50)
+
+        interaction.followup.send.assert_awaited_once()
+        assert "already trading at" in interaction.followup.send.await_args.args[0]
+        assert store.list_all() == []
+
+    @pytest.mark.asyncio
+    async def test_invalid_ticker_rejected_before_fetching(self):
+        interaction = self.make_interaction()
+
+        with patch("bot.yf.Ticker") as ticker_mock, patch(
+            "bot.reminder_store", MagicMock()
+        ):
+            await remind_in_channel.callback(interaction, "bad ticker!", 150.0)
+
+        ticker_mock.assert_not_called()
+        interaction.followup.send.assert_awaited_once()
+        assert "not a valid ticker" in interaction.followup.send.await_args.args[0]
+        assert interaction.followup.send.await_args.kwargs["ephemeral"] is True
+
+    @pytest.mark.asyncio
+    async def test_dm_channel_rejected_without_saving(self, tmp_path):
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        interaction = self.make_interaction(guild_id=None)
+
+        with patch("bot.yf.Ticker") as ticker_mock, patch(
+            "bot.reminder_store", store
+        ):
+            await remind_in_channel.callback(interaction, "NVDA", 150.0)
+
+        ticker_mock.assert_not_called()
+        interaction.followup.send.assert_awaited_once()
+        assert store.list_all() == []
+        assert "server channels" in interaction.followup.send.await_args.args[0]
+        assert interaction.followup.send.await_args.kwargs["ephemeral"] is True
+
+
 class TestRemindersCommand:
     """/reminders: owner-only listing, empty list and embed chunking."""
 
@@ -1572,6 +1701,23 @@ class TestRemindersCommand:
         assert ("#1 NVDA", "$100.00 (above)") in fields
         assert ("#2 AAPL", "$200.00 (below)") in fields
         assert not any(name.startswith("#3") for name, _ in fields)
+
+    @pytest.mark.asyncio
+    async def test_channel_alert_shows_everyone_audience(self, tmp_path):
+        """Owner alerts keep the plain value; channel alerts append @everyone."""
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        store.add_reminder(42, 10, "NVDA", 100.0, "above")
+        store.add_reminder(42, 10, "AAPL", 200.0, "below", "everyone")
+        interaction = self.make_interaction(user_id=42)
+
+        with patch("bot.reminder_store", store):
+            await reminders.callback(interaction)
+
+        kwargs = interaction.followup.send.await_args.kwargs
+        embeds = kwargs["embeds"]
+        fields = [(field.name, field.value) for embed in embeds for field in embed.fields]
+        assert ("#1 NVDA", "$100.00 (above)") in fields
+        assert ("#2 AAPL", "$200.00 (below, @everyone)") in fields
 
     @staticmethod
     def sent_messages(interaction):
@@ -2152,6 +2298,67 @@ class TestPriceAlertsChecker:
         rows = store.list_all()
         assert [row["id"] for row in rows] == [bad_id]  # NVDA retained
         assert store.get_by_id(good_id) is None  # AAPL notified
+
+    @pytest.mark.asyncio
+    async def test_due_channel_alert_pings_everyone_and_deletes(self, tmp_path):
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        reminder_id = store.add_reminder(42, 10, "NVDA", 100.0, "above", "everyone")
+        channel = self.make_channel()
+
+        with patch("bot.reminder_store", store), patch(
+            "bot.yf.Ticker", return_value=FakeTicker(extended_frame(), None, None)
+        ), patch.object(bot_module.bot, "get_channel", return_value=channel):
+            await check_price_alerts()
+
+        channel.send.assert_awaited_once()
+        content = channel.send.await_args.args[0]
+        # The literal @everyone pings; no user mention is present.
+        assert "@everyone" in content
+        assert "<@" not in content
+        assert "NVDA" in content
+        mentions = channel.send.await_args.kwargs["allowed_mentions"]
+        # @everyone only: no user, role or replied-user mentions can fire.
+        assert mentions.everyone is True
+        assert mentions.users is False
+        assert mentions.roles is False
+        assert mentions.replied_user is False
+        assert store.get_by_id(reminder_id) is None
+
+    @pytest.mark.asyncio
+    async def test_failed_send_retains_channel_alert(self, tmp_path, capsys):
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        reminder_id = store.add_reminder(42, 10, "NVDA", 100.0, "above", "everyone")
+        channel = self.make_channel(send=AsyncMock(side_effect=RuntimeError("no permission")))
+
+        with patch("bot.reminder_store", store), patch(
+            "bot.yf.Ticker", return_value=FakeTicker(extended_frame(), None, None)
+        ), patch.object(bot_module.bot, "get_channel", return_value=channel):
+            await check_price_alerts()
+
+        assert store.get_by_id(reminder_id) is not None
+        out = capsys.readouterr().out
+        assert f"alert #{reminder_id} (NVDA) send failed" in out
+
+    @pytest.mark.asyncio
+    async def test_channel_alert_audience_survives_restart(self, tmp_path):
+        db_path = tmp_path / "reminders.db"
+        store_before = ReminderStore(db_path=db_path)
+        reminder_id = store_before.add_reminder(42, 10, "NVDA", 100.0, "above", "everyone")
+
+        # Simulate a bot restart: a fresh store over the same database file.
+        store_after = ReminderStore(db_path=db_path)
+        channel = self.make_channel()
+
+        with patch("bot.reminder_store", store_after), patch(
+            "bot.yf.Ticker", return_value=FakeTicker(extended_frame(), None, None)
+        ), patch.object(bot_module.bot, "get_channel", return_value=channel):
+            await check_price_alerts()
+
+        channel.send.assert_awaited_once()
+        mentions = channel.send.await_args.kwargs["allowed_mentions"]
+        assert mentions.everyone is True
+        assert mentions.users is False
+        assert store_after.get_by_id(reminder_id) is None
 
     @pytest.mark.asyncio
     async def test_failed_send_retains_reminder(self, tmp_path, capsys):

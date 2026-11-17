@@ -4,6 +4,75 @@ All notable changes to the Discord stock price bot. The project has no tagged
 releases; this file records what changed on `dev` before it was merged into
 `main`.
 
+## Unreleased — `dev-feature-remind-in-channel`
+
+Channel-wide one-shot price alerts, relative to the `main` baseline with
+one-shot alerts (`/remind`, `/reminders`, `/unremind`, `/help`).
+
+### Added
+
+- **`/remind-in-channel <ticker> <target>` — one-shot channel-wide price
+  alerts (server channels only).** Registered with the hyphenated
+  command name. It reuses the exact `/remind` body (ticker validation,
+  positive finite target, one lightweight latest-price fetch, automatic
+  above/below direction, stale-price guard) but records the invoking
+  channel and stores the alert with the new `everyone` audience. The
+  confirmation is public to the whole invoking channel (public defer and
+  follow-up) and additionally shows the @everyone audience; mentions are
+  disabled on the confirmation message (`AllowedMentions.none()`), so the
+  literal `@everyone` in the Audience field never pings the channel at
+  setup time. Failure follow-ups stay ephemeral in both modes.
+- **Per-alert audience mode, persisted in SQLite.** The `reminders` table
+  gains an `audience` column (`'owner'` or `'everyone'`, default `'owner'`).
+  Databases created before this column existed are migrated in place on
+  first store open (`ALTER TABLE ... ADD COLUMN ... DEFAULT 'owner'`), so
+  every pre-existing alert keeps its owner-only behaviour and no data is
+  lost. `add_reminder` accepts an optional `audience` argument (default
+  `'owner'`, so existing callers are unchanged), and all listing/get paths
+  return it.
+- **@everyone notifications for channel alerts.** The 60-second checker now
+  sends each due alert with audience-specific `allowed_mentions`: owner
+  alerts keep the exact owner user mention (`users=[owner]`, `everyone=False`,
+  `roles=False`, `replied_user=False`), while channel alerts ping @everyone
+  in the original channel with `everyone=True, users=False, roles=False,
+  replied_user=False` and no user mention in the text — no unintended
+  user, role or @everyone pings in either case. Failed sends retain the
+  alert; one-shot deletion still happens only after a successful send.
+- **Audience in listings and `/help`.** `/reminders` appends
+  `@everyone` to a channel alert's field value (owner alerts keep the
+  original format), and the private `/help` guide lists
+  `/remind-in-channel`.
+- **Tests.** New coverage for `/remind-in-channel` (registration, command
+  persistence of the @everyone audience and invoking channel, DM
+  rejection, invalid ticker, equal-current-price rejection, public
+  confirmation without setup ping: public defer, public confirmation and
+  `AllowedMentions.none()` with no @everyone/user/role/replied-user ping),
+  @everyone notification mentions and one-shot deletion, failed-send
+  retention for channel alerts, audience persistence across a simulated
+  restart, the @everyone display in `/reminders`, the hyphenated command in
+  the registered command tree, and the SQLite layer (audience persistence,
+  invalid-audience rejection, legacy-schema migration with the owner
+  default, idempotent reopen).
+
+### Changed
+
+- `bot.py`: the `/remind` body moved into a shared `_create_price_alert`
+  helper called by both `/remind` (audience `owner`) and the new
+  `/remind-in-channel` (audience `everyone`); `_alert_message` and a new
+  `_alert_allowed_mentions` helper select the mention mode per alert;
+  `_build_remind_embed` and `_reminder_field_for` show the audience where
+  useful. The shared helper defers and confirms ephemerally for owner
+  alerts but publicly for channel alerts (a public confirmation requires a
+  public defer because an ephemeral defer can never be made public later);
+  the public confirmation passes `AllowedMentions.none()` so its
+  `@everyone` Audience field cannot ping at setup, and failure follow-ups
+  stay ephemeral in both modes.
+- `reminders.py`: `audience` column in the schema, `_validate_audience`
+  helper, optional `audience` parameter on `add_reminder`, and audience in
+  every `SELECT`.
+- `README.md` and `/help` document the new command and its @everyone
+  behaviour.
+
 ## Unreleased — `dev-feature-price-alerts` merged into `main` (2026-11-11)
 
 This merge brings one-shot stock price alerts and a private `/help` guide

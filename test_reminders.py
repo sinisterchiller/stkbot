@@ -9,7 +9,13 @@ import stat
 
 import pytest
 
-from reminders import ReminderStore, _validate_direction, _validate_target_price, _validate_ticker
+from reminders import (
+    ReminderStore,
+    _validate_audience,
+    _validate_direction,
+    _validate_target_price,
+    _validate_ticker,
+)
 
 
 # -- helpers -----------------------------------------------------------------
@@ -78,6 +84,29 @@ def test_add_stores_all_fields(tmp_path):
     assert row["target_price"] == 99.99
     assert row["direction"] == "below"
     assert row["created_at"] is not None
+    # The audience defaults to 'owner', so existing callers are unchanged.
+    assert row["audience"] == "owner"
+
+
+def test_add_stores_everyone_audience(tmp_path):
+    store = _make_store(tmp_path)
+    rid = store.add_reminder(42, 99, "NVDA", 99.99, "below", "everyone")
+    row = store.get_by_id(rid)
+    assert row is not None
+    assert row["audience"] == "everyone"
+    # The audience is visible through every listing path.
+    assert store.list_by_user(42)[0]["audience"] == "everyone"
+    assert store.list_all()[0]["audience"] == "everyone"
+
+
+def test_add_rejects_invalid_audience(tmp_path):
+    store = _make_store(tmp_path)
+    with pytest.raises(ValueError):
+        store.add_reminder(1, 2, "NVDA", 100.0, "above", "sideways")
+    with pytest.raises(ValueError):
+        store.add_reminder(1, 2, "NVDA", 100.0, "above", "")
+    # Nothing was inserted.
+    assert store.list_all() == []
 
 
 def test_add_rejects_invalid_target(tmp_path):
@@ -133,6 +162,16 @@ def test_validate_direction_accepts_valid():
 def test_validate_direction_rejects_invalid():
     with pytest.raises(ValueError):
         _validate_direction("sideways")
+
+
+def test_validate_audience_accepts_valid():
+    assert _validate_audience("owner") == "owner"
+    assert _validate_audience("everyone") == "everyone"
+
+
+def test_validate_audience_rejects_invalid():
+    with pytest.raises(ValueError):
+        _validate_audience("sideways")
 
 
 def test_validate_ticker_strips_and_uppercases():
@@ -246,6 +285,79 @@ def test_no_duplicate_inserts_on_failed_validation(tmp_path):
     with pytest.raises(ValueError):
         store.add_reminder(1, 10, "NVDA", 100.0, "bad")
     assert store.list_all() == []
+
+
+# -- audience migration (backward compatibility) --------------------------------
+
+_LEGACY_SCHEMA = """\
+CREATE TABLE reminders (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    channel_id INTEGER NOT NULL,
+    ticker TEXT NOT NULL,
+    target_price REAL NOT NULL,
+    direction TEXT NOT NULL CHECK (direction IN ('above', 'below')),
+    created_at TEXT NOT NULL
+);
+"""
+
+
+def _create_legacy_db(tmp_path) -> str:
+    """Create a database with the pre-audience schema and one alert.
+
+    Simulates a deployment running the old bot: the reminders table exists
+    without the audience column and holds a pending owner alert.
+    """
+    db = tmp_path / "reminders.db"
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.execute(_LEGACY_SCHEMA)
+        conn.execute(
+            "INSERT INTO reminders (user_id, channel_id, ticker, target_price, direction, created_at) "
+            "VALUES (1, 2, 'NVDA', 100.0, 'above', '2026-01-01T00:00:00+00:00')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return str(db)
+
+
+def test_legacy_db_migrates_with_owner_default(tmp_path):
+    """A pre-audience database migrates in place on first store open.
+
+    The column is added with the 'owner' default, so the existing alert
+    keeps its owner-only notification behaviour and no data is lost.
+    """
+    _create_legacy_db(tmp_path)
+    store = _make_store(tmp_path)
+
+    rows = store.list_all()
+    assert len(rows) == 1
+    assert rows[0]["ticker"] == "NVDA"
+    assert rows[0]["target_price"] == 100.0
+    assert rows[0]["direction"] == "above"
+    assert rows[0]["audience"] == "owner"
+
+    db = tmp_path / "reminders.db"
+    conn = sqlite3.connect(str(db))
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(reminders)")}
+    finally:
+        conn.close()
+    assert "audience" in cols
+
+
+def test_migrated_db_accepts_new_audiences_and_reopens_idempotently(tmp_path):
+    """After migration, new alerts keep their audience and reopening is safe."""
+    _create_legacy_db(tmp_path)
+    store1 = _make_store(tmp_path)
+    rid = store1.add_reminder(2, 20, "AAPL", 200.0, "below", "everyone")
+
+    store2 = _make_store(tmp_path)
+    rows = store2.list_all()
+    assert [row["id"] for row in rows] == [1, rid]
+    assert rows[0]["audience"] == "owner"  # migrated legacy row
+    assert rows[1]["audience"] == "everyone"
 
 
 # -- file permission hardening (POSIX-only) ------------------------------------

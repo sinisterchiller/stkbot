@@ -30,9 +30,18 @@ CREATE TABLE IF NOT EXISTS reminders (
     ticker TEXT NOT NULL,
     target_price REAL NOT NULL,
     direction TEXT NOT NULL CHECK (direction IN ('above', 'below')),
+    audience TEXT NOT NULL DEFAULT 'owner' CHECK (audience IN ('owner', 'everyone')),
     created_at TEXT NOT NULL
 );
 """
+
+# Databases created before the audience column existed are migrated in
+# place: the column is added with a NOT NULL 'owner' default, so every
+# pre-existing alert keeps its owner-only notification behaviour.
+_MIGRATE_ADD_AUDIENCE = (
+    "ALTER TABLE reminders ADD COLUMN audience TEXT NOT NULL DEFAULT 'owner' "
+    "CHECK (audience IN ('owner', 'everyone'))"
+)
 
 # --- helpers ----------------------------------------------------------------
 
@@ -55,6 +64,15 @@ def _validate_direction(direction: str) -> str:
             f"direction must be 'above' or 'below', got {direction!r}"
         )
     return direction
+
+
+def _validate_audience(audience: str) -> str:
+    """Return *audience* when it is 'owner' or 'everyone', else raise ValueError."""
+    if audience not in ("owner", "everyone"):
+        raise ValueError(
+            f"audience must be 'owner' or 'everyone', got {audience!r}"
+        )
+    return audience
 
 
 def _validate_ticker(ticker: str) -> str:
@@ -187,8 +205,16 @@ class ReminderStore:
         return conn
 
     def _ensure_schema(self, conn: sqlite3.Connection) -> None:
-        """Create the reminders table if it does not exist yet."""
+        """Create the reminders table if it does not exist yet.
+
+        A pre-existing table missing the audience column is migrated in
+        place on first open; the 'owner' default preserves the
+        owner-only notification behaviour of every existing alert.
+        """
         conn.execute(_SCHEMA)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(reminders)")}
+        if "audience" not in columns:
+            conn.execute(_MIGRATE_ADD_AUDIENCE)
         conn.commit()
 
     # -- CRUD ----------------------------------------------------------------
@@ -200,26 +226,32 @@ class ReminderStore:
         ticker: str,
         target_price,
         direction: str,
+        audience: str = "owner",
     ) -> int:
         """Insert a pending reminder and return its new integer ID.
+
+        *audience* selects the notification audience: 'owner' mentions only
+        the alert owner, 'everyone' pings @everyone in the channel. It
+        defaults to 'owner' so existing callers are unchanged.
 
         Raises
         ------
         ValueError
-            If *ticker*, *target_price*, or *direction* is invalid.
+            If *ticker*, *target_price*, *direction*, or *audience* is invalid.
         """
         clean_ticker = _validate_ticker(ticker)
         price = _validate_target_price(target_price)
         clean_direction = _validate_direction(direction)
+        clean_audience = _validate_audience(audience)
         now = datetime.now(timezone.utc).isoformat()
 
         conn = self._connect()
         try:
             self._ensure_schema(conn)
             cursor = conn.execute(
-                "INSERT INTO reminders (user_id, channel_id, ticker, target_price, direction, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (user_id, channel_id, clean_ticker, price, clean_direction, now),
+                "INSERT INTO reminders (user_id, channel_id, ticker, target_price, direction, audience, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (user_id, channel_id, clean_ticker, price, clean_direction, clean_audience, now),
             )
             conn.commit()
             return cursor.lastrowid  # type: ignore[return-value]
@@ -232,7 +264,7 @@ class ReminderStore:
         try:
             self._ensure_schema(conn)
             rows = conn.execute(
-                "SELECT id, user_id, channel_id, ticker, target_price, direction, created_at "
+                "SELECT id, user_id, channel_id, ticker, target_price, direction, audience, created_at "
                 "FROM reminders WHERE user_id = ? ORDER BY id",
                 (user_id,),
             ).fetchall()
@@ -246,7 +278,7 @@ class ReminderStore:
         try:
             self._ensure_schema(conn)
             rows = conn.execute(
-                "SELECT id, user_id, channel_id, ticker, target_price, direction, created_at "
+                "SELECT id, user_id, channel_id, ticker, target_price, direction, audience, created_at "
                 "FROM reminders ORDER BY id"
             ).fetchall()
             return [_row_to_dict(r) for r in rows]
@@ -259,7 +291,7 @@ class ReminderStore:
         try:
             self._ensure_schema(conn)
             row = conn.execute(
-                "SELECT id, user_id, channel_id, ticker, target_price, direction, created_at "
+                "SELECT id, user_id, channel_id, ticker, target_price, direction, audience, created_at "
                 "FROM reminders WHERE id = ?",
                 (reminder_id,),
             ).fetchone()

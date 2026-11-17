@@ -1,8 +1,9 @@
 """Discord stock price bot with /price and one-shot price alerts.
 
-Slash commands: /price, /remind, /reminders, /unremind and /help. A background
-task checks pending alerts once every 60 seconds and notifies their owners in
-the original guild channel; alerts persist in a local SQLite database.
+Slash commands: /price, /remind, /remind-in-channel, /reminders, /unremind and
+/help. A background task checks pending alerts once every 60 seconds and
+notifies their owners in the original guild channel (or pings @everyone for
+channel alerts); alerts persist in a local SQLite database.
 """
 
 import asyncio
@@ -863,7 +864,8 @@ async def price(interaction: discord.Interaction, ticker: str):
 
 
 # ---------------------------------------------------------------------------
-# Price alerts: /remind, /reminders, /unremind and the 60-second checker.
+# Price alerts: /remind, /remind-in-channel, /reminders, /unremind and the
+# 60-second checker.
 
 reminder_store = ReminderStore()
 
@@ -874,8 +876,15 @@ def _build_remind_embed(
     direction: str,
     target_price: float,
     quote: LatestPrice,
+    audience: str = "owner",
 ) -> discord.Embed:
-    """Ephemeral confirmation embed for a newly created price alert."""
+    """Confirmation embed for a newly created price alert.
+
+    Channel ('everyone') alerts add an Audience field so the invoker can see
+    the alert will ping @everyone when it fires; owner alerts keep the
+    original layout. The public channel confirmation is sent with all
+    mentions disabled, so the literal "@everyone" in this field never pings.
+    """
     direction_text = "rising above" if direction == "above" else "falling below"
     embed = discord.Embed(
         title=f"Price alert #{reminder_id} set",
@@ -892,6 +901,8 @@ def _build_remind_embed(
     embed.add_field(name="Target", value=f"${target_price:.2f}", inline=True)
     embed.add_field(name="Current", value=f"${quote.price:.2f}", inline=True)
     embed.add_field(name="Direction", value=direction, inline=True)
+    if audience == "everyone":
+        embed.add_field(name="Audience", value="@everyone in this channel", inline=True)
     return embed
 
 
@@ -901,11 +912,13 @@ def _reminder_field_for(row: dict) -> tuple[str, str]:
     Field names and values are built from bounded inputs (integer ID,
     TICKER_PATTERN ticker, positive finite price with ``%.2f``), so they
     always stay inside Discord's 256-character name and 1024-character value
-    limits without truncation.
+    limits without truncation. Channel alerts append the @everyone audience
+    so the listing shows which alerts ping the whole channel.
     """
+    audience_text = ", @everyone" if row.get("audience") == "everyone" else ""
     return (
         f"#{row['id']} {row['ticker']}",
-        f"${row['target_price']:.2f} ({row['direction']})",
+        f"${row['target_price']:.2f} ({row['direction']}{audience_text})",
     )
 
 
@@ -991,13 +1004,43 @@ def _build_reminder_embeds(rows: list[dict]) -> list[discord.Embed]:
 
 
 def _alert_message(row: dict, quote: LatestPrice) -> str:
-    """Alert text mentioning the owner; user mentions only, delayed caveat."""
+    """Alert text for the alert's audience; delayed caveat.
+
+    Owner alerts mention exactly the owner's user ID; channel alerts carry a
+    literal ``@everyone`` that the channel-audience allowed mentions turn
+    into a ping.
+    """
     direction_text = "rose above" if row["direction"] == "above" else "fell below"
+    if row["audience"] == "everyone":
+        mention = "@everyone"
+    else:
+        mention = f"<@{row['user_id']}>"
     return (
-        f"<@{row['user_id']}> 🔔 **{row['ticker']}** {direction_text} its target: "
+        f"{mention} 🔔 **{row['ticker']}** {direction_text} its target: "
         f"latest ${quote.price:.2f} vs target ${row['target_price']:.2f}.\n"
         f"Quote as of {_format_timestamp(quote.timestamp, None)} — "
         "delayed / latest available, not real-time."
+    )
+
+
+def _alert_allowed_mentions(row: dict) -> discord.AllowedMentions:
+    """Allowed mentions for the alert's audience.
+
+    Owner alerts mention exactly the owner's user ID; channel alerts ping
+    @everyone and nothing else, so no user, role or replied-user mention can
+    fire from the text in either case.
+    """
+    if row["audience"] == "everyone":
+        return discord.AllowedMentions(
+            everyone=True, users=False, roles=False, replied_user=False
+        )
+    return discord.AllowedMentions(
+        # Restrict mentions to the alert owner's user ID exactly;
+        # @everyone, @role and replied-user mentions must stay off.
+        users=[discord.Object(id=row["user_id"])],
+        everyone=False,
+        roles=False,
+        replied_user=False,
     )
 
 
@@ -1018,8 +1061,9 @@ async def check_price_alerts() -> None:
 
     Loads every pending reminder, fetches one lightweight quote per unique
     ticker, and for each due reminder (price >= target for 'above',
-    <= target for 'below') sends a user-mentioning message to the original
-    guild channel. The reminder is deleted only after a successful send;
+    <= target for 'below') sends a message to the original guild channel:
+    an owner mention for 'owner' alerts, an @everyone ping for 'everyone'
+    channel alerts. The reminder is deleted only after a successful send;
     any channel lookup, quote fetch, or send failure retains it for the
     next cycle. DM channels never receive alerts.
     """
@@ -1063,14 +1107,7 @@ async def check_price_alerts() -> None:
         try:
             await channel.send(
                 _alert_message(row, quote),
-                allowed_mentions=discord.AllowedMentions(
-                    # Restrict mentions to the alert owner's user ID exactly;
-                    # @everyone, @role and replied-user mentions must stay off.
-                    users=[discord.Object(id=row["user_id"])],
-                    everyone=False,
-                    roles=False,
-                    replied_user=False,
-                ),
+                allowed_mentions=_alert_allowed_mentions(row),
             )
         except Exception as exc:
             print(
@@ -1104,23 +1141,41 @@ async def price_alerts_loop():
         print(f"WARNING: price alert cycle failed: {type(exc).__name__}")
 
 
-@bot.tree.command(
-    name="remind",
-    description="Set a one-shot price alert for a ticker",
-)
-@app_commands.describe(ticker="Stock ticker symbol (e.g., NVDA)")
-@app_commands.describe(target="Target price to alert on")
-async def remind(interaction: discord.Interaction, ticker: str, target: float):
-    """Slash command to set a one-shot price alert.
+async def _create_price_alert(
+    interaction: discord.Interaction,
+    ticker: str,
+    target,
+    audience: str,
+) -> None:
+    """Shared body for /remind and /remind-in-channel.
 
-    The direction is derived from the fetched price (target above current
-    means 'above', below means 'below'), and a target equal to the current
-    price at displayed precision is rejected, so an alert created on a
-    stale closed-market quote cannot fire on that same stale value.
+    Validates the ticker and a positive finite target, fetches one
+    lightweight latest price, derives the direction from it (target above
+    current means 'above', below means 'below'), rejects a target equal to
+    the current price at displayed precision so an alert created on a stale
+    closed-market quote cannot fire on that same stale value, then persists
+    the alert with the given audience and confirms it.
+
+    Visibility: 'owner' alerts defer and confirm ephemerally, so the
+    confirmation and every follow-up stay visible only to the invoking user.
+    'everyone' channel alerts defer and confirm publicly so every member of
+    the invoking channel can see the confirmation; an ephemeral defer can
+    never be made public later, which is why the channel mode defers publicly
+    from the start. The public confirmation disables all mentions
+    (AllowedMentions.none()) because its Audience field contains a literal
+    "@everyone" that must not ping the channel at setup time. Failure
+    follow-ups stay ephemeral in both modes: a follow-up can always be marked
+    ephemeral, even after a public defer.
     """
-    # Ephemeral defer keeps the private confirmation and every follow-up
-    # response visible only to the invoking user.
-    await interaction.response.defer(thinking=True, ephemeral=True)
+    channel_alert = audience == "everyone"
+    if channel_alert:
+        # Public defer: the channel-wide confirmation must be visible to
+        # everyone, and an ephemeral defer can never be made public later.
+        await interaction.response.defer(thinking=True, ephemeral=False)
+    else:
+        # Ephemeral defer keeps the private confirmation and every follow-up
+        # response visible only to the invoking user.
+        await interaction.response.defer(thinking=True, ephemeral=True)
 
     normalized = ticker.strip().upper()
     channel = interaction.channel
@@ -1176,11 +1231,54 @@ async def remind(interaction: discord.Interaction, ticker: str, target: float):
         normalized,
         target_price,
         direction,
+        audience,
     )
-    await interaction.followup.send(
-        embed=_build_remind_embed(reminder_id, normalized, direction, target_price, quote),
-        ephemeral=True,
-    )
+    embed = _build_remind_embed(reminder_id, normalized, direction, target_price, quote, audience)
+    if channel_alert:
+        # Public confirmation for the whole channel; mentions are disabled
+        # so the Audience field's literal "@everyone" cannot ping at setup.
+        await interaction.followup.send(
+            embed=embed,
+            ephemeral=False,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    else:
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(
+    name="remind",
+    description="Set a one-shot price alert for a ticker",
+)
+@app_commands.describe(ticker="Stock ticker symbol (e.g., NVDA)")
+@app_commands.describe(target="Target price to alert on")
+async def remind(interaction: discord.Interaction, ticker: str, target: float):
+    """Slash command to set a one-shot, owner-only price alert.
+
+    The alert mentions only its owner when it fires; use /remind-in-channel
+    for a channel-wide @everyone alert.
+    """
+    await _create_price_alert(interaction, ticker, target, "owner")
+
+
+@bot.tree.command(
+    name="remind-in-channel",
+    description="Set a one-shot price alert that pings @everyone in this channel",
+)
+@app_commands.describe(ticker="Stock ticker symbol (e.g., NVDA)")
+@app_commands.describe(target="Target price to alert on")
+async def remind_in_channel(interaction: discord.Interaction, ticker: str, target: float):
+    """Slash command to set a one-shot, channel-wide price alert.
+
+    Behaves like /remind (same ticker validation, direction derivation and
+    stale-price guard) in a server channel, but records the invoking
+    channel and stores the alert with the 'everyone' audience: when it
+    fires, the notification is posted in the original channel with an
+    @everyone ping and no user or role mentions. The confirmation is public
+    to the whole invoking channel and shows the @everyone audience without
+    pinging anyone at setup.
+    """
+    await _create_price_alert(interaction, ticker, target, "everyone")
 
 
 @bot.tree.command(name="reminders", description="List your pending price alerts")
@@ -1232,9 +1330,11 @@ def _build_help_embed() -> discord.Embed:
     embed = discord.Embed(
         title="Stock bot commands",
         description=(
-            "This guide, and reminder confirmations and lists, are private "
-            "(ephemeral). /price answers are public in the channel, and fired "
-            "alerts post in the channel where you created them, mentioning you."
+            "This guide, /remind confirmations, reminder lists and "
+            "cancellations are private (ephemeral). /price answers and "
+            "/remind-in-channel confirmations are public in the channel, and "
+            "fired alerts post in the channel where you created them, "
+            "mentioning you."
         ),
         color=discord.Color.blue(),
     )
@@ -1253,6 +1353,17 @@ def _build_help_embed() -> discord.Embed:
             "Set a one-shot price alert (server channels only). The direction "
             "(above/below) is chosen automatically from the current price, and "
             "you get a private confirmation with the alert ID."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="/remind-in-channel <ticker> <target>",
+        value=(
+            "Set a one-shot price alert (server channels only) that pings "
+            "@everyone in this channel when it fires, instead of mentioning "
+            "only you. Same automatic direction and validation as /remind, "
+            "with a public confirmation that shows the @everyone audience "
+            "without pinging anyone at setup."
         ),
         inline=False,
     )
