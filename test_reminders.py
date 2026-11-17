@@ -223,6 +223,75 @@ def test_list_all_returns_every_pending(tmp_path):
     assert ids == sorted(ids)
 
 
+# -- list_by_channel (channel-scoped listing) --------------------------------
+
+
+def test_list_by_channel_returns_only_everyone_alerts_in_that_channel(tmp_path):
+    """The listing is scoped by channel ID and audience: owner alerts and
+    other channels' alerts are excluded, in ID order."""
+    store = _make_store(tmp_path)
+    owner_id = store.add_reminder(1, 10, "NVDA", 100.0, "above")
+    own_id = store.add_reminder(2, 10, "AAPL", 200.0, "below", "everyone")
+    other_id = store.add_reminder(1, 20, "TSLA", 300.0, "above", "everyone")
+
+    rows = store.list_by_channel(10)
+    assert [row["id"] for row in rows] == [own_id]
+    assert rows[0]["audience"] == "everyone"
+    assert rows[0]["armed"] == 1
+    # The owner alert and the other channel's alert are not listed.
+    listed_ids = [row["id"] for row in rows]
+    assert owner_id not in listed_ids
+    assert other_id not in listed_ids
+
+
+def test_list_by_channel_empty(tmp_path):
+    store = _make_store(tmp_path)
+    store.add_reminder(1, 10, "NVDA", 100.0, "above")  # owner alert only
+    assert store.list_by_channel(10) == []
+    assert store.list_by_channel(99) == []
+
+
+# -- delete_channel_alert (atomic owner+channel+audience authorization) -------
+
+
+def test_delete_channel_alert_owned_in_channel(tmp_path):
+    store = _make_store(tmp_path)
+    rid = store.add_reminder(1, 10, "NVDA", 100.0, "above", "everyone")
+    assert store.delete_channel_alert(rid, user_id=1, channel_id=10) is True
+    assert store.get_by_id(rid) is None
+
+
+def test_delete_channel_alert_cross_user_prevented(tmp_path):
+    """A different user cannot delete the alert even from the same channel."""
+    store = _make_store(tmp_path)
+    rid = store.add_reminder(1, 10, "NVDA", 100.0, "above", "everyone")
+    assert store.delete_channel_alert(rid, user_id=2, channel_id=10) is False
+    # The alert is untouched.
+    assert store.get_by_id(rid) is not None
+
+
+def test_delete_channel_alert_cross_channel_prevented(tmp_path):
+    """The owner cannot delete the alert from a different channel."""
+    store = _make_store(tmp_path)
+    rid = store.add_reminder(1, 10, "NVDA", 100.0, "above", "everyone")
+    assert store.delete_channel_alert(rid, user_id=1, channel_id=20) is False
+    assert store.get_by_id(rid) is not None
+
+
+def test_delete_channel_alert_owner_audience_prevented(tmp_path):
+    """Owner ('owner') alerts are one-shot and only /unremind may delete them;
+    this path never touches them, even for the owner in the right channel."""
+    store = _make_store(tmp_path)
+    rid = store.add_reminder(1, 10, "NVDA", 100.0, "above")
+    assert store.delete_channel_alert(rid, user_id=1, channel_id=10) is False
+    assert store.get_by_id(rid) is not None
+
+
+def test_delete_channel_alert_unknown_id(tmp_path):
+    store = _make_store(tmp_path)
+    assert store.delete_channel_alert(9999, user_id=1, channel_id=10) is False
+
+
 # -- set_armed (channel alert state) ------------------------------------------
 
 

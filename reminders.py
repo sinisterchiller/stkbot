@@ -283,6 +283,24 @@ class ReminderStore:
         finally:
             conn.close()
 
+    def list_by_channel(self, channel_id: int) -> list[dict]:
+        """Return every channel ('everyone') alert in *channel_id*, ordered by ID.
+
+        Owner alerts are excluded: /reminders-in-channel lists only the
+        channel-wide alerts that ping @everyone in that channel.
+        """
+        conn = self._connect()
+        try:
+            self._ensure_schema(conn)
+            rows = conn.execute(
+                "SELECT id, user_id, channel_id, ticker, target_price, direction, audience, armed, created_at "
+                "FROM reminders WHERE channel_id = ? AND audience = 'everyone' ORDER BY id",
+                (channel_id,),
+            ).fetchall()
+            return [_row_to_dict(r) for r in rows]
+        finally:
+            conn.close()
+
     def list_all(self) -> list[dict]:
         """Return every pending reminder, ordered by ID."""
         conn = self._connect()
@@ -322,6 +340,31 @@ class ReminderStore:
             cursor = conn.execute(
                 "DELETE FROM reminders WHERE id = ? AND user_id = ?",
                 (reminder_id, user_id),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+        finally:
+            conn.close()
+
+    def delete_channel_alert(
+        self, reminder_id: int, user_id: int, channel_id: int
+    ) -> bool:
+        """Delete a channel alert **only** when every authorization fact matches.
+
+        One atomic DELETE authorized by alert ID, invoking user, channel and
+        the 'everyone' audience together, so a cross-channel invoke, a
+        different user, or an owner ('owner' audience) alert can never be
+        deleted through this path.
+
+        Returns True when a row was deleted, False otherwise.
+        """
+        conn = self._connect()
+        try:
+            self._ensure_schema(conn)
+            cursor = conn.execute(
+                "DELETE FROM reminders WHERE id = ? AND user_id = ? AND channel_id = ? "
+                "AND audience = 'everyone'",
+                (reminder_id, user_id, channel_id),
             )
             conn.commit()
             return cursor.rowcount > 0

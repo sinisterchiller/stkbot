@@ -1,9 +1,11 @@
-"""Discord stock price bot with /price and one-shot price alerts.
+"""Discord stock price bot with /price and price alerts.
 
-Slash commands: /price, /remind, /remind-in-channel, /reminders, /unremind and
-/help. A background task checks pending alerts once every 60 seconds and
-notifies their owners in the original guild channel (or pings @everyone for
-channel alerts); alerts persist in a local SQLite database.
+Slash commands: /price, /remind, /remind-in-channel, /reminders,
+/reminders-in-channel, /unremind, /unremind-in-channel and /help. A
+background task checks pending alerts once every 60 seconds and notifies
+the alert owner in the original guild channel (or pings @everyone for
+channel alerts); owner alerts are one-shot, channel alerts persist until
+deleted, and all alerts are stored in a local SQLite database.
 """
 
 import asyncio
@@ -1003,6 +1005,55 @@ def _build_reminder_embeds(rows: list[dict]) -> list[discord.Embed]:
     return embeds
 
 
+def _channel_reminder_field_for(row: dict) -> tuple[str, str]:
+    """The one field a channel alert row becomes in a /reminders-in-channel embed.
+
+    Field names and values are built from bounded inputs (integer ID,
+    TICKER_PATTERN ticker, positive finite price with ``%.2f``), so they
+    always stay inside Discord's 256-character name and 1024-character value
+    limits without truncation. The value carries the persisted armed state:
+    a disarmed alert has already fired on its latest crossing and stays
+    silent until the price crosses back to the other side of the target.
+    """
+    status = "armed" if row["armed"] else "disarmed"
+    return (
+        f"#{row['id']} {row['ticker']}",
+        f"${row['target_price']:.2f} ({row['direction']}, {status})",
+    )
+
+
+def _build_channel_reminder_embeds(rows: list[dict]) -> list[discord.Embed]:
+    """Embeds for /reminders-in-channel, chunked inside Discord's per-embed limits.
+
+    The same budgeting as /reminders: a new embed starts when the field count
+    would reach REMINDER_FIELDS_PER_EMBED or the embed's total text would
+    exceed REMINDER_EMBED_CHAR_BUDGET (a safety margin below Discord's 6000
+    character embed cap), so every channel alert keeps its armed/disarmed
+    status visible without truncating any alert.
+    """
+    embeds: list[discord.Embed] = []
+    embed: Optional[discord.Embed] = None
+    for row in rows:
+        name, value = _channel_reminder_field_for(row)
+        field_chars = len(name) + len(value)
+        if (
+            embed is None
+            or len(embed.fields) >= REMINDER_FIELDS_PER_EMBED
+            or _reminder_embed_char_count(embed) + field_chars
+            > REMINDER_EMBED_CHAR_BUDGET
+        ):
+            if embed is not None:
+                embeds.append(embed)
+            embed = discord.Embed(
+                title="This channel's @everyone price alerts",
+                color=discord.Color.blue(),
+            )
+        embed.add_field(name=name, value=value, inline=True)
+    if embed is not None:
+        embeds.append(embed)
+    return embeds
+
+
 def _alert_message(row: dict, quote: LatestPrice) -> str:
     """Alert text for the alert's audience; delayed caveat.
 
@@ -1291,20 +1342,22 @@ async def remind(interaction: discord.Interaction, ticker: str, target: float):
 
 @bot.tree.command(
     name="remind-in-channel",
-    description="Set a one-shot price alert that pings @everyone in this channel",
+    description="Set a persistent price alert that pings @everyone in this channel",
 )
 @app_commands.describe(ticker="Stock ticker symbol (e.g., NVDA)")
 @app_commands.describe(target="Target price to alert on")
 async def remind_in_channel(interaction: discord.Interaction, ticker: str, target: float):
-    """Slash command to set a one-shot, channel-wide price alert.
+    """Slash command to set a persistent, channel-wide price alert.
 
     Behaves like /remind (same ticker validation, direction derivation and
     stale-price guard) in a server channel, but records the invoking
     channel and stores the alert with the 'everyone' audience: when it
     fires, the notification is posted in the original channel with an
-    @everyone ping and no user or role mentions. The confirmation is public
-    to the whole invoking channel and shows the @everyone audience without
-    pinging anyone at setup.
+    @everyone ping and no user or role mentions. The alert persists until
+    deleted with /unremind-in-channel; a successful send disarms it, and it
+    re-arms once the price crosses back to the other side of the target. The
+    confirmation is public to the whole invoking channel and shows the
+    @everyone audience without pinging anyone at setup.
     """
     await _create_price_alert(interaction, ticker, target, "everyone")
 
@@ -1348,6 +1401,93 @@ async def unremind(interaction: discord.Interaction, id: int):
         )
 
 
+@bot.tree.command(
+    name="reminders-in-channel",
+    description="List this channel's @everyone price alerts",
+)
+async def reminders_in_channel(interaction: discord.Interaction):
+    """Slash command to list the invoking channel's channel-wide alerts (public).
+
+    Lists only the invoking channel's 'everyone' alerts — never owner alerts
+    and never alerts from other channels — with each alert's ID, ticker,
+    target, direction and persisted armed/disarmed status. The response is
+    public to the invoking channel with all mentions disabled, so the
+    @everyone in the embed title never pings anyone, and long lists are
+    split across several messages, each inside Discord's embed and message
+    limits. DMs get a friendly ephemeral reply.
+    """
+    await interaction.response.defer(thinking=True, ephemeral=False)
+
+    channel = interaction.channel
+    if getattr(channel, "guild", None) is None:
+        await interaction.followup.send(
+            "Channel alerts only work in server channels, not DMs.",
+            ephemeral=True,
+        )
+        return
+
+    rows = await asyncio.to_thread(reminder_store.list_by_channel, channel.id)
+    if not rows:
+        await interaction.followup.send(
+            "This channel has no @everyone price alerts. Use /remind-in-channel "
+            "to create one.",
+            ephemeral=False,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return
+
+    for message_embeds in _reminder_embed_messages(_build_channel_reminder_embeds(rows)):
+        await interaction.followup.send(
+            embeds=message_embeds,
+            ephemeral=False,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+
+@bot.tree.command(
+    name="unremind-in-channel",
+    description="Cancel one of this channel's @everyone price alerts by ID",
+)
+@app_commands.describe(id="Alert ID shown by /reminders-in-channel")
+async def unremind_in_channel(interaction: discord.Interaction, id: int):
+    """Slash command to cancel a channel alert by ID (owner and channel only, public).
+
+    Deletes the alert only when the invoking user owns it *and* it is an
+    'everyone' alert in the invoking channel — the store authorizes both in
+    one atomic SQL DELETE, so a cross-channel invoke, another user's alert
+    or an owner alert is never deleted through this path. The result is
+    public to the invoking channel with all mentions disabled, so no
+    @everyone ping can fire from the reply. DMs get a friendly ephemeral
+    reply.
+    """
+    await interaction.response.defer(thinking=True, ephemeral=False)
+
+    channel = interaction.channel
+    if getattr(channel, "guild", None) is None:
+        await interaction.followup.send(
+            "Channel alerts only work in server channels, not DMs.",
+            ephemeral=True,
+        )
+        return
+
+    deleted = await asyncio.to_thread(
+        reminder_store.delete_channel_alert, id, interaction.user.id, channel.id
+    )
+    if deleted:
+        await interaction.followup.send(
+            f"✅ Channel alert #{id} cancelled.",
+            ephemeral=False,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    else:
+        await interaction.followup.send(
+            f"❌ No @everyone alert with ID {id} belongs to you in this channel. "
+            "Check /reminders-in-channel.",
+            ephemeral=False,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+
 def _build_help_embed() -> discord.Embed:
     """The private /help guide: one field per command plus a how-alerts-work note.
 
@@ -1358,11 +1498,12 @@ def _build_help_embed() -> discord.Embed:
     embed = discord.Embed(
         title="Stock bot commands",
         description=(
-            "This guide, /remind confirmations, reminder lists and "
-            "cancellations are private (ephemeral). /price answers and "
-            "/remind-in-channel confirmations are public in the channel, and "
+            "This guide, /remind confirmations, /reminders lists and "
+            "/unremind cancellations are private (ephemeral). /price answers, "
+            "/remind-in-channel confirmations, and /reminders-in-channel and "
+            "/unremind-in-channel responses are public in the channel, and "
             "fired alerts post in the channel where you created them, "
-            "mentioning you."
+            "mentioning you (or pinging @everyone for channel alerts)."
         ),
         color=discord.Color.blue(),
     )
@@ -1387,11 +1528,13 @@ def _build_help_embed() -> discord.Embed:
     embed.add_field(
         name="/remind-in-channel <ticker> <target>",
         value=(
-            "Set a one-shot price alert (server channels only) that pings "
+            "Set a persistent price alert (server channels only) that pings "
             "@everyone in this channel when it fires, instead of mentioning "
             "only you. Same automatic direction and validation as /remind, "
             "with a public confirmation that shows the @everyone audience "
-            "without pinging anyone at setup."
+            "without pinging anyone at setup; it persists until you delete "
+            "it with /unremind-in-channel and re-arms when the price "
+            "crosses back."
         ),
         inline=False,
     )
@@ -1409,11 +1552,34 @@ def _build_help_embed() -> discord.Embed:
         inline=False,
     )
     embed.add_field(
+        name="/reminders-in-channel",
+        value=(
+            "List this channel's @everyone alerts, publicly, with their IDs and "
+            "armed/disarmed status. This is where you get the alert IDs used "
+            "by /unremind-in-channel."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="/unremind-in-channel <id>",
+        value=(
+            "Cancel one of your @everyone alerts in this channel using the ID "
+            "shown by /reminders-in-channel. It only deletes your own channel "
+            "alerts in the invoking channel."
+        ),
+        inline=False,
+    )
+    embed.add_field(
         name="How alerts work",
         value=(
-            "Checked once every 60 seconds; each alert fires exactly once and "
-            "mentions you in the channel where you created it. Yahoo data can "
-            "be delayed and is not real-time."
+            "Checked once every 60 seconds. Owner alerts are one-shot: each "
+            "one mentions you in the channel where you created it and is "
+            "deleted after firing. /remind-in-channel alerts are public to the "
+            "channel, "
+            "ping @everyone when they fire, persist until you delete them with "
+            "/unremind-in-channel, and re-arm once the price crosses back to the "
+            "other side of the target. Yahoo data can be delayed and is not "
+            "real-time."
         ),
         inline=False,
     )

@@ -6,22 +6,25 @@ releases; this file records what changed on `dev` before it was merged into
 
 ## Unreleased — `dev-feature-remind-in-channel`
 
-Channel-wide one-shot price alerts, relative to the `main` baseline with
+Channel-wide persistent price alerts, relative to the `main` baseline with
 one-shot alerts (`/remind`, `/reminders`, `/unremind`, `/help`).
 
 ### Added
 
-- **`/remind-in-channel <ticker> <target>` — one-shot channel-wide price
-  alerts (server channels only).** Registered with the hyphenated
+- **`/remind-in-channel <ticker> <target>` — persistent channel-wide
+  price alerts (server channels only).** Registered with the hyphenated
   command name. It reuses the exact `/remind` body (ticker validation,
   positive finite target, one lightweight latest-price fetch, automatic
   above/below direction, stale-price guard) but records the invoking
-  channel and stores the alert with the new `everyone` audience. The
-  confirmation is public to the whole invoking channel (public defer and
-  follow-up) and additionally shows the @everyone audience; mentions are
-  disabled on the confirmation message (`AllowedMentions.none()`), so the
-  literal `@everyone` in the Audience field never pings the channel at
-  setup time. Failure follow-ups stay ephemeral in both modes.
+  channel and stores the alert with the new `everyone` audience, which
+  persists until deleted with `/unremind-in-channel`: a successful send
+  disarms it and it re-arms once the price crosses back to the other side
+  of the target. The confirmation is public to the whole invoking channel
+  (public defer and follow-up) and additionally shows the @everyone
+  audience; mentions are disabled on the confirmation message
+  (`AllowedMentions.none()`), so the literal `@everyone` in the Audience
+  field never pings the channel at setup time. Failure follow-ups stay
+  ephemeral in both modes.
 - **Per-alert audience mode, persisted in SQLite.** The `reminders` table
   gains an `audience` column (`'owner'` or `'everyone'`, default `'owner'`).
   Databases created before this column existed are migrated in place on
@@ -37,22 +40,50 @@ one-shot alerts (`/remind`, `/reminders`, `/unremind`, `/help`).
   in the original channel with `everyone=True, users=False, roles=False,
   replied_user=False` and no user mention in the text — no unintended
   user, role or @everyone pings in either case. Failed sends retain the
-  alert; one-shot deletion still happens only after a successful send.
+  alert; owner alerts are deleted only after a successful send, and
+  channel alerts are disarmed only after a successful send (re-arming on
+  the reverse crossing).
 - **Audience in listings and `/help`.** `/reminders` appends
   `@everyone` to a channel alert's field value (owner alerts keep the
   original format), and the private `/help` guide lists
   `/remind-in-channel`.
-- **Tests.** New coverage for `/remind-in-channel` (registration, command
-  persistence of the @everyone audience and invoking channel, DM
-  rejection, invalid ticker, equal-current-price rejection, public
-  confirmation without setup ping: public defer, public confirmation and
-  `AllowedMentions.none()` with no @everyone/user/role/replied-user ping),
-  @everyone notification mentions and one-shot deletion, failed-send
-  retention for channel alerts, audience persistence across a simulated
-  restart, the @everyone display in `/reminders`, the hyphenated command in
-  the registered command tree, and the SQLite layer (audience persistence,
-  invalid-audience rejection, legacy-schema migration with the owner
-  default, idempotent reopen).
+- **`/reminders-in-channel` — public channel-scoped alert list (server
+  channels only).** Registered with the hyphenated command name. Lists only
+  the invoking channel's `everyone` alerts — never owner alerts and never
+  alerts from other channels — with each alert's ID, ticker, target,
+  direction and persisted armed/disarmed status (a disarmed alert has fired
+  on its latest crossing and stays silent until the price crosses back). The
+  response is public to the invoking channel with all mentions disabled
+  (`AllowedMentions.none()`), so the `@everyone` in the embed title never
+  pings the channel; long lists are chunked with the same embed/message
+  budgets as `/reminders`, and an empty list or a DM gets a friendly reply.
+- **`/unremind-in-channel <id>` — owner+channel-scoped channel alert
+  cancellation (server channels only).** Registered with the hyphenated
+  command name. Deletes the alert only when the invoking user owns it *and*
+  it is an `everyone` alert in the invoking channel: the store authorizes
+  all of that in one atomic SQL `DELETE ... WHERE id = ? AND user_id = ? AND
+  channel_id = ? AND audience = 'everyone'`, so a cross-channel invoke,
+  another user's alert and owner alerts are never deleted through this
+  path. The result is public to the invoking channel with all mentions
+  disabled, so no @everyone ping can fire from the reply; a DM gets a
+  friendly ephemeral reply.
+- **Channel-scoped storage paths.** `ReminderStore` gains `list_by_channel`
+  (every `everyone` alert in a channel, owner alerts excluded, ordered by
+  ID) and `delete_channel_alert` (the atomic owner+channel+audience
+  delete above).
+- **Tests.** New coverage for `/reminders-in-channel` (registration in the
+  command tree, channel isolation with owner-alert and other-channel
+  exclusion, armed/disarmed display, public chunking within Discord's limits
+  with no @everyone ping on any follow-up, empty list, DM rejection) and
+  `/unremind-in-channel` (owner+channel+audience authorization: cross-user,
+  cross-channel and owner-alert deletes prevented, unknown ID, public reply
+  with no @everyone ping, DM rejection), plus the SQLite layer (channel-
+  scoped listing, empty listing, and the atomic delete's four authorization
+  cases).
+- **Docs.** `/help` and `README.md` document the two new commands and state
+  the alert lifecycles explicitly: `/remind-in-channel` alerts persist
+  until explicitly deleted, re-arm on the reverse crossing, and owner-only
+  alerts remain one-shot.
 
 ### Changed
 
@@ -66,12 +97,16 @@ one-shot alerts (`/remind`, `/reminders`, `/unremind`, `/help`).
   public defer because an ephemeral defer can never be made public later);
   the public confirmation passes `AllowedMentions.none()` so its
   `@everyone` Audience field cannot ping at setup, and failure follow-ups
-  stay ephemeral in both modes.
+  stay ephemeral in both modes. New `_channel_reminder_field_for` and
+  `_build_channel_reminder_embeds` helpers build the public channel listing
+  with per-alert armed status, and the `/help` embed gains the two new
+  command fields plus an alert-lifecycle note (one-shot owner alerts vs
+  persistent, re-arming channel alerts).
 - `reminders.py`: `audience` column in the schema, `_validate_audience`
-  helper, optional `audience` parameter on `add_reminder`, and audience in
-  every `SELECT`.
-- `README.md` and `/help` document the new command and its @everyone
-  behaviour.
+  helper, optional `audience` parameter on `add_reminder`, audience in
+  every `SELECT`, plus `list_by_channel` and `delete_channel_alert`.
+- `README.md` and `/help` document the new commands, the @everyone
+  behaviour and the alert lifecycles.
 
 ## Unreleased — `dev-feature-price-alerts` merged into `main` (2026-11-11)
 

@@ -31,8 +31,10 @@ from bot import (
     remind,
     remind_in_channel,
     reminders,
+    reminders_in_channel,
     sync_commands,
     unremind,
+    unremind_in_channel,
 )
 from reminders import ReminderStore
 
@@ -1101,9 +1103,10 @@ class TestCommandRegistration:
 
         run_mock.assert_called_once_with("test-token")
 
-    def test_command_tree_registers_all_six_commands(self):
+    def test_command_tree_registers_all_commands(self):
         # The real bot tree must expose every slash command, including /help
-        # and the hyphenated /remind-in-channel.
+        # and the hyphenated /remind-in-channel, /reminders-in-channel and
+        # /unremind-in-channel.
         names = sorted(command.name for command in bot_module.bot.tree.get_commands())
         assert names == [
             "help",
@@ -1111,7 +1114,9 @@ class TestCommandRegistration:
             "remind",
             "remind-in-channel",
             "reminders",
+            "reminders-in-channel",
             "unremind",
+            "unremind-in-channel",
         ]
 
 
@@ -2023,6 +2028,279 @@ class TestUnremindCommand:
         interaction.followup.send.assert_awaited_once()
         assert "belongs to you" in interaction.followup.send.await_args.args[0]
         assert interaction.followup.send.await_args.kwargs["ephemeral"] is True
+
+
+class TestRemindersInChannelCommand:
+    """/reminders-in-channel: public channel-scoped listing with armed status."""
+
+    @staticmethod
+    def make_interaction(user_id=42, channel_id=10, guild_id=111):
+        interaction = MagicMock()
+        interaction.user = SimpleNamespace(id=user_id)
+        interaction.channel = SimpleNamespace(
+            id=channel_id, guild=SimpleNamespace(id=guild_id) if guild_id is not None else None
+        )
+        interaction.response.defer = AsyncMock()
+        interaction.followup.send = AsyncMock()
+        return interaction
+
+    @staticmethod
+    def sent_messages(interaction):
+        """Every follow-up send as an (ephemeral, embeds) pair, in order."""
+        return [
+            (call.kwargs["ephemeral"], call.kwargs["embeds"])
+            for call in interaction.followup.send.await_args_list
+        ]
+
+    @staticmethod
+    def assert_discord_limits(messages):
+        """Same caps as /reminders, but every message must be public."""
+        for ephemeral, embeds in messages:
+            assert ephemeral is False
+            assert len(embeds) <= REMINDER_EMBEDS_PER_MESSAGE
+            assert (
+                sum(TestRemindersCommand.embed_chars(embed) for embed in embeds)
+                <= REMINDER_MESSAGE_CHAR_BUDGET
+            )
+            for embed in embeds:
+                assert len(embed.fields) <= REMINDER_FIELDS_PER_EMBED
+                assert (
+                    TestRemindersCommand.embed_chars(embed) <= REMINDER_EMBED_CHAR_BUDGET
+                )
+                for field in embed.fields:
+                    assert len(field.name) <= 256
+                    assert len(field.value) <= 1024
+
+    @pytest.mark.asyncio
+    async def test_lists_only_everyone_alerts_in_the_invoking_channel(self, tmp_path):
+        """Channel isolation: only 'everyone' alerts of the invoking channel,
+        in ID order; owner alerts and other channels' alerts are excluded."""
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        store.add_reminder(42, 10, "NVDA", 100.0, "above", "everyone")
+        store.add_reminder(42, 10, "AAPL", 200.0, "below")  # owner alert: excluded
+        store.add_reminder(99, 10, "TSLA", 300.0, "above", "everyone")  # other user, same channel
+        store.add_reminder(42, 20, "MSFT", 400.0, "above", "everyone")  # other channel
+        interaction = self.make_interaction(channel_id=10)
+
+        with patch("bot.reminder_store", store):
+            await reminders_in_channel.callback(interaction)
+
+        interaction.response.defer.assert_awaited_once_with(thinking=True, ephemeral=False)
+        interaction.followup.send.assert_awaited_once()
+        kwargs = interaction.followup.send.await_args.kwargs
+        assert kwargs["ephemeral"] is False
+        fields = [(field.name, field.value) for embed in kwargs["embeds"] for field in embed.fields]
+        assert ("#1 NVDA", "$100.00 (above, armed)") in fields
+        assert ("#3 TSLA", "$300.00 (above, armed)") in fields
+        assert [name for name, _ in fields] == ["#1 NVDA", "#3 TSLA"]
+
+    @pytest.mark.asyncio
+    async def test_disarmed_alert_shows_disarmed_status(self, tmp_path):
+        """The persisted armed bit is shown: disarmed alerts have fired on
+        their latest crossing and are silent until the price crosses back."""
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        armed_id = store.add_reminder(42, 10, "NVDA", 100.0, "above", "everyone")
+        disarmed_id = store.add_reminder(42, 10, "AAPL", 200.0, "below", "everyone")
+        store.set_armed(disarmed_id, False)
+        interaction = self.make_interaction(channel_id=10)
+
+        with patch("bot.reminder_store", store):
+            await reminders_in_channel.callback(interaction)
+
+        kwargs = interaction.followup.send.await_args.kwargs
+        fields = [(field.name, field.value) for embed in kwargs["embeds"] for field in embed.fields]
+        assert (f"#{armed_id} NVDA", "$100.00 (above, armed)") in fields
+        assert (f"#{disarmed_id} AAPL", "$200.00 (below, disarmed)") in fields
+
+    @pytest.mark.asyncio
+    async def test_public_list_never_pings_everyone(self, tmp_path):
+        """Every public follow-up disables all mentions, so the @everyone in
+        the embed title cannot ping the channel."""
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        store.add_reminder(42, 10, "NVDA", 100.0, "above", "everyone")
+        interaction = self.make_interaction(channel_id=10)
+
+        with patch("bot.reminder_store", store):
+            await reminders_in_channel.callback(interaction)
+
+        assert interaction.followup.send.await_count >= 1
+        for call in interaction.followup.send.await_args_list:
+            mentions = call.kwargs["allowed_mentions"]
+            assert mentions.everyone is False
+            assert mentions.users is False
+            assert mentions.roles is False
+            assert mentions.replied_user is False
+
+    @pytest.mark.asyncio
+    async def test_empty_list_is_friendly_public(self, tmp_path):
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        store.add_reminder(42, 20, "NVDA", 100.0, "above", "everyone")  # other channel
+        interaction = self.make_interaction(channel_id=10)
+
+        with patch("bot.reminder_store", store):
+            await reminders_in_channel.callback(interaction)
+
+        interaction.followup.send.assert_awaited_once()
+        kwargs = interaction.followup.send.await_args.kwargs
+        assert kwargs["ephemeral"] is False
+        assert "no @everyone price alerts" in interaction.followup.send.await_args.args[0]
+        assert kwargs["allowed_mentions"].everyone is False
+
+    @pytest.mark.asyncio
+    async def test_dm_rejected_ephemerally_without_listing(self, tmp_path):
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        store.add_reminder(42, 10, "NVDA", 100.0, "above", "everyone")
+        interaction = self.make_interaction(guild_id=None)
+
+        with patch("bot.reminder_store", store):
+            await reminders_in_channel.callback(interaction)
+
+        interaction.followup.send.assert_awaited_once()
+        assert "server channels" in interaction.followup.send.await_args.args[0]
+        assert interaction.followup.send.await_args.kwargs["ephemeral"] is True
+        # Nothing was listed and nothing was deleted.
+        assert store.list_by_channel(10) != []
+
+    @pytest.mark.asyncio
+    async def test_many_alerts_chunk_into_bounded_public_messages(self, tmp_path):
+        # 120 channel alerts fit in one public message as 5 embeds (25 fields
+        # each, last 20), in order, with every message inside Discord's limits.
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        for index in range(120):
+            store.add_reminder(42, 10, "NVDA", 100.0 + index, "above", "everyone")
+        interaction = self.make_interaction(channel_id=10)
+
+        with patch("bot.reminder_store", store):
+            await reminders_in_channel.callback(interaction)
+
+        interaction.response.defer.assert_awaited_once_with(thinking=True, ephemeral=False)
+        messages = self.sent_messages(interaction)
+        assert len(messages) == 1
+        self.assert_discord_limits(messages)
+        embeds = messages[0][1]
+        assert [len(embed.fields) for embed in embeds] == [25, 25, 25, 25, 20]
+        names = [field.name for embed in embeds for field in embed.fields]
+        assert names[0] == "#1 NVDA"
+        assert names[-1] == "#120 NVDA"
+        assert len(names) == 120
+
+
+class TestUnremindInChannelCommand:
+    """/unremind-in-channel: owner+channel+audience-scoped channel alert cancellation."""
+
+    @staticmethod
+    def make_interaction(user_id=42, channel_id=10, guild_id=111):
+        interaction = MagicMock()
+        interaction.user = SimpleNamespace(id=user_id)
+        interaction.channel = SimpleNamespace(
+            id=channel_id, guild=SimpleNamespace(id=guild_id) if guild_id is not None else None
+        )
+        interaction.response.defer = AsyncMock()
+        interaction.followup.send = AsyncMock()
+        return interaction
+
+    @staticmethod
+    def assert_no_ping(kwargs):
+        """A public reply must disable every mention kind, so no @everyone,
+        user or role ping can fire from it."""
+        mentions = kwargs["allowed_mentions"]
+        assert mentions.everyone is False
+        assert mentions.users is False
+        assert mentions.roles is False
+        assert mentions.replied_user is False
+
+    @pytest.mark.asyncio
+    async def test_owner_can_cancel_own_channel_alert_in_channel(self, tmp_path):
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        reminder_id = store.add_reminder(42, 10, "NVDA", 100.0, "above", "everyone")
+        interaction = self.make_interaction(user_id=42, channel_id=10)
+
+        with patch("bot.reminder_store", store):
+            await unremind_in_channel.callback(interaction, reminder_id)
+
+        interaction.response.defer.assert_awaited_once_with(thinking=True, ephemeral=False)
+        interaction.followup.send.assert_awaited_once()
+        kwargs = interaction.followup.send.await_args.kwargs
+        assert "cancelled" in interaction.followup.send.await_args.args[0]
+        assert kwargs["ephemeral"] is False
+        self.assert_no_ping(kwargs)
+        assert store.get_by_id(reminder_id) is None
+
+    @pytest.mark.asyncio
+    async def test_cross_user_cancellation_prevented(self, tmp_path):
+        """Another user cannot delete the alert even from the same channel."""
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        reminder_id = store.add_reminder(42, 10, "NVDA", 100.0, "above", "everyone")
+        interaction = self.make_interaction(user_id=99, channel_id=10)
+
+        with patch("bot.reminder_store", store):
+            await unremind_in_channel.callback(interaction, reminder_id)
+
+        interaction.followup.send.assert_awaited_once()
+        kwargs = interaction.followup.send.await_args.kwargs
+        assert "belongs to you" in interaction.followup.send.await_args.args[0]
+        assert kwargs["ephemeral"] is False
+        self.assert_no_ping(kwargs)
+        assert store.get_by_id(reminder_id) is not None
+
+    @pytest.mark.asyncio
+    async def test_cross_channel_cancellation_prevented(self, tmp_path):
+        """The owner cannot delete the alert from a different channel."""
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        reminder_id = store.add_reminder(42, 10, "NVDA", 100.0, "above", "everyone")
+        interaction = self.make_interaction(user_id=42, channel_id=20)
+
+        with patch("bot.reminder_store", store):
+            await unremind_in_channel.callback(interaction, reminder_id)
+
+        interaction.followup.send.assert_awaited_once()
+        assert "belongs to you" in interaction.followup.send.await_args.args[0]
+        assert store.get_by_id(reminder_id) is not None
+
+    @pytest.mark.asyncio
+    async def test_owner_alert_cancellation_prevented(self, tmp_path):
+        """Owner ('owner') alerts are one-shot and only /unremind may delete
+        them; /unremind-in-channel never touches them."""
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        reminder_id = store.add_reminder(42, 10, "NVDA", 100.0, "above")
+        interaction = self.make_interaction(user_id=42, channel_id=10)
+
+        with patch("bot.reminder_store", store):
+            await unremind_in_channel.callback(interaction, reminder_id)
+
+        interaction.followup.send.assert_awaited_once()
+        kwargs = interaction.followup.send.await_args.kwargs
+        assert "belongs to you" in interaction.followup.send.await_args.args[0]
+        assert store.get_by_id(reminder_id) is not None
+
+    @pytest.mark.asyncio
+    async def test_unknown_id_reports_failure(self, tmp_path):
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        interaction = self.make_interaction(user_id=42, channel_id=10)
+
+        with patch("bot.reminder_store", store):
+            await unremind_in_channel.callback(interaction, 9999)
+
+        interaction.followup.send.assert_awaited_once()
+        kwargs = interaction.followup.send.await_args.kwargs
+        assert "belongs to you" in interaction.followup.send.await_args.args[0]
+        assert kwargs["ephemeral"] is False
+        self.assert_no_ping(kwargs)
+
+    @pytest.mark.asyncio
+    async def test_dm_rejected_ephemerally_without_deleting(self, tmp_path):
+        store = ReminderStore(db_path=tmp_path / "reminders.db")
+        reminder_id = store.add_reminder(42, 10, "NVDA", 100.0, "above", "everyone")
+        interaction = self.make_interaction(guild_id=None)
+
+        with patch("bot.reminder_store", store):
+            await unremind_in_channel.callback(interaction, reminder_id)
+
+        interaction.followup.send.assert_awaited_once()
+        assert "server channels" in interaction.followup.send.await_args.args[0]
+        assert interaction.followup.send.await_args.kwargs["ephemeral"] is True
+        # Nothing was deleted.
+        assert store.get_by_id(reminder_id) is not None
 
 
 class TestHelpCommand:
